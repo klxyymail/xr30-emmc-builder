@@ -1,24 +1,16 @@
-name: ImmortalWrt 24.10 (k6.6) for CMCC XR30 eMMC
+name: Build ImmortalWrt · CMCC XR30 eMMC
 
 # ============================================================================
-#  所有可变内容都在 configs/<机型名>.config 里：
-#    加插件        → 配置文件里加 CONFIG_PACKAGE_xxx=y
-#    加第三方仓库  → 配置文件的 ## [feeds] 段加一行
-#    换机型        → 复制一份 .config 改名，Actions 页面自动出现选项
-#    换源码/分支   → 改 ## [source] 段
-#    改 IP/主机名  → 改 ## [custom] 段
-#  加新机型的方法：复制 configs/ 下任一 .config，改文件名与内容即可，
-#  本文件和 Actions 的选项都不用动（选项用文本输入，自动发现 configs/ 内容）
+#  CMCC XR30 eMMC（RAX3000Z 增强版 / 算力版）
+#
+#  源码 / 分支 / 机型 / feeds / 定制项 全部集中在本文件顶部 env 段。
+#  日常改插件 → 改 configs/ 下的 .config（只用写 CONFIG_PACKAGE_xxx=y）
+#  改源码/分支/feeds → 改下面 env 段
 # ============================================================================
 
 on:
   workflow_dispatch:
     inputs:
-      config:
-        description: '机型配置文件名（留空 = 用 configs/ 下第一个）'
-        required: false
-        default: ''
-        type: string
       mode:
         description: '构建模式'
         required: false
@@ -27,155 +19,114 @@ on:
         options:
           - auto        # 有 ImageBuilder 缓存就组装，否则完整编译
           - assemble    # 强制组装（没有 IB 则报错）
-          - full        # 强制完整编译（会重新生成 ImageBuilder）
-      enable_ssh:
-        description: '编译失败时开启 SSH 调试 (tmate)'
-        required: false
-        default: false
-        type: boolean
+          - full        # 强制完整编译（重新生成 ImageBuilder）
       use_cache:
-        description: '启用缓存加速（dl 下载 + ccache + Go 缓存）'
+        description: '启用缓存加速'
         required: false
         default: true
         type: boolean
 
-  # 定时触发：仅在检测到上游源码有新提交时才构建
-  # UTC 周二 02:00 = 北京时间周二 10:00
-  # 注：定时构建时自动使用 configs/ 下第一个配置文件
+  # 定时：UTC 周二 02:00 = 北京时间 10:00，检测到上游更新才构建
   schedule:
     - cron: '0 2 * * 2'
 
 permissions:
   contents: write
 
-# 同一时间只允许一个构建在跑，避免定时任务与手动触发打架
 concurrency:
-  group: build-firmware
+  group: build-xr30-emmc
   cancel-in-progress: false
 
 env:
-  CONFIG_DIR: configs
-  STATE_FILE: .upstream-commit
-  # ccache 设置（OpenWrt 原生 CONFIG_CCACHE 会读取这些）
-  # 2G 而非常见的 5G：GitHub 每个仓库缓存总配额 10GB，
-  # 需要与 ImageBuilder / dl / Go 缓存共存，ccache 过大会挤掉它们。
-  # 且组装模式成为主路径后完整编译跑得少，ccache 无需太大。
+  # ==========================================================================
+  #  源码（修改这里换源码 / 分支）
+  # ==========================================================================
+  REPO_URL:    'https://github.com/padavanonly/immortalwrt-mt798x-6.6'
+  REPO_BRANCH: 'openwrt-24.10-6.6'
+
+  # ==========================================================================
+  #  机型（target/subtarget/device 三者决定编出什么固件）
+  #  当前 6.6 内核分支没有 cmcc_xr30-emmc，用硬件相同的 RAX3000M eMMC 目标
+  # ==========================================================================
+  TARGET:    mediatek
+  SUBTARGET: filogic
+  DEVICE:    cmcc_rax3000m-emmc-mtk
+  DEFCONFIG: mt7981-ax3000.config
+
+  # ==========================================================================
+  #  第三方插件仓库（追加到 feeds.conf.default 末尾，官方源优先级更高）
+  #  格式: 名字 空格 地址;分支
+  # ==========================================================================
+  FEEDS: |
+    helloworld https://github.com/fw876/helloworld.git;dev
+    istore     https://github.com/linkease/istore.git;main
+    lucky      https://github.com/gdy666/luci-app-lucky.git;main
+    oaf        https://github.com/destan19/OpenAppFilter.git;master
+
+  # ==========================================================================
+  #  固件定制（改这里 = 改 IP / 主机名 / 主题）
+  # ==========================================================================
+  LAN_IP:   192.168.6.1
+  HOSTNAME: ImmortalWrt
+  TIMEZONE: CST-8
+  ZONENAME: Asia/Shanghai
+  THEME:    argon
+
+  # ==========================================================================
+  #  硬件加速（HNAT / PPE）出厂默认开关
+  #
+  #  源码默认是【开启】的：defconfig 编译 kmod-mediatek_hnat，
+  #  且 luci-app-turboacc-mtk 的 uci-defaults 在首次启动时写入
+  #    fastpath=mediatek_hnat / fastpath_mh_eth_hnat=1 / v6=1
+  #
+  #  ⚠ 但硬件加速与下列功能【互斥】，开启时它们全部失效：
+  #      · ssr-plus / passwall 透明代理（流量不过 CPU，无法重定向）
+  #      · OAF 应用过滤（不经过 netfilter 钩子，识别不到应用）
+  #
+  #    0 = 关闭硬件加速（当前默认，因为本配置装了上述插件）
+  #    1 = 开启硬件加速（跑满 NAT 性能，但代理与 OAF 失效）
+  #
+  #  刷机后仍可在 LuCI 的「Turbo ACC 网络加速」页面随时手动切换，
+  #  这里只决定【出厂默认值】。
+  # ==========================================================================
+  HW_OFFLOAD: 0
+
+  # --------------------------------------------------------------------------
+  CONFIG_DIR:  configs
+  CONFIG_FILE: configs/cmcc_xr30_emmc.config
+  STATE_FILE:  .upstream-commit-cmcc_xr30_emmc
   CCACHE_MAXSIZE: 2G
   CCACHE_COMPRESS: '1'
   TZ: Asia/Shanghai
 
 jobs:
-  # ------------------------------------------------------------------
-  # 选配置 + 检测上游是否有新提交
-  # ------------------------------------------------------------------
   check:
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.decide.outputs.changed }}
-      config_file: ${{ steps.cfg.outputs.file }}
-      device: ${{ steps.cfg.outputs.device }}
-      head_sha: ${{ steps.fetch.outputs.sha }}
-      head_short: ${{ steps.fetch.outputs.short }}
-      head_msg: ${{ steps.fetch.outputs.msg }}
-      head_date: ${{ steps.fetch.outputs.date }}
-      reason: ${{ steps.decide.outputs.reason }}
+      head_sha:     ${{ steps.fetch.outputs.sha }}
+      head_short:   ${{ steps.fetch.outputs.short }}
+      head_msg:     ${{ steps.fetch.outputs.msg }}
+      head_date:    ${{ steps.fetch.outputs.date }}
+      reason:       ${{ steps.decide.outputs.reason }}
     steps:
       - name: 检出本仓库
         uses: actions/checkout@v5
 
-      - name: 选择并解析机型配置
-        id: cfg
-        run: |
-          cd "$CONFIG_DIR"
-
-          echo "=== configs/ 下可用的机型配置 ==="
-          ls -1 *.config 2>/dev/null | sed 's/^/  - /' || true
-          echo
-
-          # 确定用哪个配置文件
-          CFG_INPUT="${{ inputs.config }}"
-          if [ -n "$CFG_INPUT" ]; then
-            CFG_FILE="$CFG_INPUT"
-            # 容错：用户可能写了 configs/ 前缀或漏了 .config 后缀
-            CFG_FILE=$(basename "$CFG_FILE" .config).config
-            if [ ! -f "$CFG_FILE" ]; then
-              echo "::error::找不到配置文件 $CFG_FILE"
-              echo "可用配置："
-              ls -1 *.config
-              exit 1
-            fi
-            echo "使用指定配置: $CFG_FILE"
-          else
-            CFG_FILE=$(ls -1 *.config 2>/dev/null | head -1)
-            if [ -z "$CFG_FILE" ]; then
-              echo "::error::configs/ 目录下没有找到任何 .config 文件"
-              exit 1
-            fi
-            echo "未指定，自动选择第一个: $CFG_FILE"
-          fi
-          echo "file=$CFG_FILE" >> "$GITHUB_OUTPUT"
-
-          # ---- 解析元数据段 ----
-          # 用法: meta <段名> <键名>
-          meta() {
-            sed -n "/^## \[$1\]/,/^## \[/p" "$CFG_FILE" \
-              | grep -E "^##[[:space:]]+$2[[:space:]]*=" \
-              | head -1 \
-              | sed -E "s/^##[[:space:]]+$2[[:space:]]*=[[:space:]]*//" \
-              | sed -E 's/[[:space:]]+$//'
-          }
-
-          REPO=$(meta source repo)
-          BRANCH=$(meta source branch)
-          DEVICE=$(meta device device)
-          TARGET=$(meta device target)
-          SUBTARGET=$(meta device subtarget)
-
-          for v in "repo:$REPO" "branch:$BRANCH" "device:$DEVICE" \
-                   "target:$TARGET" "subtarget:$SUBTARGET"; do
-            key="${v%%:*}"; val="${v#*:}"
-            if [ -z "$val" ]; then
-              echo "::error::配置文件 $CFG_FILE 的 [source]/[device] 段缺少 $key"
-              exit 1
-            fi
-          done
-
-          echo "repo=$REPO"       >> "$GITHUB_OUTPUT"
-          echo "branch=$BRANCH"   >> "$GITHUB_OUTPUT"
-          echo "device=$DEVICE"   >> "$GITHUB_OUTPUT"
-          echo "target=$TARGET"   >> "$GITHUB_OUTPUT"
-          echo "subtarget=$SUBTARGET" >> "$GITHUB_OUTPUT"
-
-          # 回显到日志，方便核对
-          echo
-          echo "=== 解析结果 ==="
-          echo "  源码仓库 : $REPO"
-          echo "  分支     : $BRANCH"
-          echo "  设备目标 : $TARGET / $SUBTARGET / $DEVICE"
-          echo
-          echo "  第三方仓库:"
-          sed -n "/^## \[feeds\]/,/^## \[/p" "$CFG_FILE" \
-            | grep -E '^##[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*=' \
-            | sed -E 's/^##[[:space:]]+([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$/    \1 -> \2/' \
-            | sed -E 's/[[:space:]]+$//'
-
       - name: 获取上游最新提交
         id: fetch
         run: |
-          set -e
-          SHA=$(git ls-remote "${{ steps.cfg.outputs.repo }}" \
-                  "refs/heads/${{ steps.cfg.outputs.branch }}" | awk '{print $1}')
+          SHA=$(git ls-remote "${{ env.REPO_URL }}" \
+                  "refs/heads/${{ env.REPO_BRANCH }}" | awk '{print $1}')
           if [ -z "$SHA" ]; then
-            echo "::error::无法获取上游分支 ${{ steps.cfg.outputs.branch }} 的提交号"
+            echo "::error::无法获取 ${{ env.REPO_BRANCH }} 的提交号"
             exit 1
           fi
           echo "上游 HEAD: $SHA"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short=$(echo "$SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
-          # 上游提交信息与日期（读公开仓库，带 token 提高限流额度）
-          REPO_PATH=$(echo "${{ steps.cfg.outputs.repo }}" \
-                      | sed -E 's#https://github.com/##; s#\.git$##')
+          REPO_PATH=$(echo "${{ env.REPO_URL }}" | sed -E 's#https://github.com/##; s#\.git$##')
           JSON=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" \
                       -H "Accept: application/vnd.github+json" \
                       "https://api.github.com/repos/$REPO_PATH/commits/$SHA" || true)
@@ -191,13 +142,8 @@ jobs:
         with:
           script: |
             const sha = '${{ steps.fetch.outputs.sha }}';
-            const branch = '${{ steps.cfg.outputs.branch }}';
-            const device = '${{ steps.cfg.outputs.device }}';
-            const cfgFile = '${{ steps.cfg.outputs.file }}';
-
-            // 状态文件按机型分开记录，多机型互不干扰
-            const stateFile = `.upstream-commit-${device}`;
-
+            const branch = '${{ env.REPO_BRANCH }}';
+            const stateFile = '${{ env.STATE_FILE }}';
             let prev = '';
             try {
               const { data } = await github.rest.repos.getContent({
@@ -210,22 +156,11 @@ jobs:
             } catch (e) {
               if (e.status !== 404) throw e;
             }
-
             const changed = prev !== sha;
-
-            core.info(`机型:       ${device}`);
-            core.info(`配置文件:   ${cfgFile}`);
-            core.info(`上游分支:   ${branch}`);
-            core.info(`已构建提交: ${prev || '（无，首次运行）'}`);
-            core.info(`上游最新:   ${sha}`);
-            core.info(`是否有更新: ${changed}`);
-
-            // 只有两种触发方式：手动 与 定时
             let shouldBuild, reason;
             if (context.eventName === 'workflow_dispatch') {
               shouldBuild = true;
               reason = '手动触发';
-              core.info('手动触发，跳过更新检测');
             } else if (changed) {
               shouldBuild = true;
               reason = '上游有更新';
@@ -233,28 +168,20 @@ jobs:
               shouldBuild = false;
               reason = '上游无更新，跳过';
             }
-
             core.setOutput('changed', String(shouldBuild));
             core.setOutput('reason', reason);
-
             await core.summary.addRaw([
-              '## 构建决策',
-              '',
-              '| 项目 | 值 |',
-              '| --- | --- |',
-              `| 配置文件 | \`${cfgFile}\` |`,
-              `| 设备目标 | \`${device}\` |`,
-              `| 上游分支 | \`${branch}\` |`,
-              `| 已构建提交 | \`${(prev || '无').slice(0, 7)}\` |`,
-              `| 上游最新提交 | \`${sha.slice(0, 7)}\` |`,
-              `| 是否有更新 | ${changed ? '是' : '否'} |`,
-              `| 触发原因 | ${reason} |`,
-              `| 本次动作 | ${shouldBuild ? '**构建固件**' : '跳过'} |`,
+              '## 构建决策', '',
+              '| 项目 | 值 |', '| --- | --- |',
+              `| 源码 | \`${{ env.REPO_URL }}\` |`,
+              `| 分支 | \`${{ env.REPO_BRANCH }}\` |`,
+              `| 设备 | \`${{ env.DEVICE }}\` |`,
+              `| 已构建 | \`${(prev || '无').slice(0, 7)}\` |`,
+              `| 上游 | \`${sha.slice(0, 7)}\` |`,
+              `| 更新 | ${changed ? '是' : '否'} |`,
+              `| 动作 | ${shouldBuild ? '**构建**' : '跳过'} |`,
             ].join('\n')).write();
 
-  # ------------------------------------------------------------------
-  # 编译固件
-  # ------------------------------------------------------------------
   build:
     needs: check
     if: needs.check.outputs.should_build == 'true'
@@ -262,7 +189,6 @@ jobs:
     timeout-minutes: 350
     env:
       USE_CACHE: ${{ github.event_name == 'schedule' || inputs.use_cache }}
-      CFG: ${{ needs.check.outputs.config_file }}
 
     steps:
       - name: 检出本仓库
@@ -279,11 +205,9 @@ jobs:
           docker-images: true
           swap-storage: false
 
-      - name: 构建环境信息
+      - name: 环境信息
         run: |
-          echo "CPU 核心: $(nproc)"
-          free -h
-          df -hT /
+          echo "CPU: $(nproc)"; free -h; df -hT /
 
       - name: 安装编译依赖
         if: ${{ env.ASSEMBLE != '1' }}
@@ -301,80 +225,28 @@ jobs:
             texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
           sudo apt-get clean
 
-      - name: 解析机型配置
-        id: meta
-        run: |
-          F="$CONFIG_DIR/$CFG"
-          meta() {
-            sed -n "/^## \[$1\]/,/^## \[/p" "$F" \
-              | grep -E "^##[[:space:]]+$2[[:space:]]*=" \
-              | head -1 \
-              | sed -E "s/^##[[:space:]]+$2[[:space:]]*=[[:space:]]*//" \
-              | sed -E 's/[[:space:]]+$//'
-          }
-          echo "REPO_URL=$(meta source repo)"       >> "$GITHUB_ENV"
-          echo "REPO_BRANCH=$(meta source branch)"  >> "$GITHUB_ENV"
-          # 配置文件内容指纹，用于缓存 key。
-          # 这里用 shell 计算而非 hashFiles(format(...)) ——
-          # GitHub Actions 表达式不支持函数嵌套，会直接报错。
-          echo "CFG_HASH=$(md5sum "$F" | cut -d' ' -f1 | cut -c1-12)" >> "$GITHUB_ENV"
-          echo "TARGET=$(meta device target)"       >> "$GITHUB_ENV"
-          echo "SUBTARGET=$(meta device subtarget)" >> "$GITHUB_ENV"
-          echo "DEVICE_NAME=$(meta device device)"  >> "$GITHUB_ENV"
-          echo "DEFCONFIG=$(meta device defconfig)" >> "$GITHUB_ENV"
-          echo "LAN_IP=$(meta custom lan_ip)"       >> "$GITHUB_ENV"
-          echo "HOSTNAME=$(meta custom hostname)"   >> "$GITHUB_ENV"
-          echo "TZONE=$(meta custom timezone)"      >> "$GITHUB_ENV"
-          echo "ZONENAME=$(meta custom zonename)"   >> "$GITHUB_ENV"
-          echo "THEME=$(meta custom theme)"         >> "$GITHUB_ENV"
-
-          # 第三方仓库导出为 FEED_<序号> 环境变量
-          # 提取后每行为 "名字 仓库地址;分支"（保留名字，feeds.conf 需要它）
-          i=0
-          sed -n "/^## \[feeds\]/,/^## \[/p" "$F" \
-            | grep -E '^##[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*=' \
-            | sed -E 's/^##[[:space:]]+([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$/\1 \2/' \
-            | sed -E 's/[[:space:]]+$//' \
-            | while IFS= read -r line; do
-                [ -z "$line" ] && continue
-                echo "FEED_$i=$line" >> "$GITHUB_ENV"
-                i=$((i+1))
-              done
-          echo "=== 解析到的第三方仓库 ==="
-          sed -n "/^## \[feeds\]/,/^## \[/p" "$F" \
-            | grep -E '^##[[:space:]]+[A-Za-z0-9_-]+[[:space:]]*=' \
-            | sed -E 's/^##[[:space:]]+([A-Za-z0-9_-]+)[[:space:]]*=[[:space:]]*(.*)$/    \1 -> \2/'
-
       - name: 拉取源码
         run: |
-          git clone --depth 1 --single-branch -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          git clone --depth 1 --single-branch -b "${{ env.REPO_BRANCH }}" "${{ env.REPO_URL }}" openwrt
           cd openwrt
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          KV=$(grep -m1 -E '^LINUX_VERSION-(6\.6|5\.4|5\.15) *=' include/kernel-* 2>/dev/null \
+          KV=$(grep -m1 -E '^LINUX_VERSION-6\.6 ' include/kernel-* 2>/dev/null \
                | head -1 | awk '{print $3}')
-          echo "KERNEL=${KV:-未知}" >> "$GITHUB_ENV"
+          echo "KERNEL=${KV:-6.6}" >> "$GITHUB_ENV"
 
-      # ==================================================================
-      #  【组装模式判定】
-      #
-      #  ImageBuilder 是完整编译的副产物，内含：
-      #    预编译内核 + 所有 kmod（含闭源 mt_wifi）+ 全部 .ipk 包仓库
-      #  拿到它之后改固件 = make image = 纯组装，不编译任何东西，约 3-10 分钟。
-      #
-      #  cache key 用【内核版本】而非源码 commit：
-      #    内核不变 → IB 内部 kmod 与内核天然匹配（vermagic 一致），可安全复用
-      #    内核变了 → 必须重新完整编译，否则产出的是旧内核固件
-      #  这里刻意不用 restore-keys 回退，避免误用旧内核的 IB。
-      # ==================================================================
-      - name: 尝试恢复 ImageBuilder
+      - name: 计算配置指纹（用于缓存 key）
+        run: echo "CFG_HASH=$(md5sum "${{ env.CONFIG_FILE }}" | cut -d' ' -f1 | cut -c1-12)" >> "$GITHUB_ENV"
+
+      # ======================== ImageBuilder 缓存 ========================
+      - name: 恢复 ImageBuilder
         id: try_ib
         if: ${{ inputs.mode != 'full' }}
         uses: actions/cache/restore@v4
         with:
           path: ibcache
-          key: ib-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-${{ env.KERNEL }}
+          key: ib-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.KERNEL }}
 
-      - name: 解压 ImageBuilder 并检测包完整性
+      - name: 解压 IB 并检测包完整性
         if: ${{ inputs.mode != 'full' }}
         run: |
           IB=$(ls ibcache/*imagebuilder*.tar.zst 2>/dev/null | head -1)
@@ -383,36 +255,19 @@ jobs:
             echo "未命中 ImageBuilder 缓存"
             exit 0
           fi
-
           echo "IB_HIT=1" >> "$GITHUB_ENV"
-          echo "解压 $IB ..."
           command -v zstd >/dev/null || sudo apt-get install -y -qq zstd
           mkdir -p "$GITHUB_WORKSPACE/ib"
           tar -I zstd -xf "$GITHUB_WORKSPACE/$IB" -C "$GITHUB_WORKSPACE/ib" --strip-components=1
           echo "内嵌包数量: $(ls "$GITHUB_WORKSPACE/ib"/packages/*.ipk 2>/dev/null | wc -l)"
 
-          # 提前算出配置里哪些包在 IB 中不存在。
-          # 这一步必须在决定构建路径【之前】做：
-          #   缺失包为空 → 走组装（3-10 分钟）
-          #   缺失包非空 → 转完整编译（把新包编译进 IB）
-          # 若不做检测而直接组装，新包会被静默跳过，
-          # 用户会拿到一个"以为加了插件其实没加"的固件。
-          # ---- 区分「真包名」与「伪配置项」----
-          # 配置文件里存在两类非包名的项：
-          #   ① 功能开关：dnsmasq_full_auth（真身是 dnsmasq-full）
-          #   ② 模式选项：luci-app-ssr-plus_Nftables_Transparent_Proxy（真身 luci-app-ssr-plus）
-          # 它们的共同形式是 <真包名>_<选项>，因此逐级截掉下划线后缀回退匹配：
-          # 能匹配到 IB 中已存在的包 → 认定为该包的选项，静默忽略；
-          # 截到底都匹配不上 → 才是真正缺失、需要编译的新包。
-          # 不做这层区分的话，每次都会被误判为"有缺失"而永远走完整编译。
           PKGS=$(grep -oE '^CONFIG_PACKAGE_[A-Za-z0-9_.-]+=y' \
-                   "$GITHUB_WORKSPACE/$CONFIG_DIR/$CFG" \
+                   "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" \
                  | sed 's/^CONFIG_PACKAGE_//; s/=y$//' \
                  | grep -vE '_INCLUDE_|_EXCLUDE_' | sort -u)
 
           pkg_exists() {
-            local n="$1" alt
-            alt=$(echo "$n" | tr '_' '-')          # dnsmasq_full -> dnsmasq-full
+            local n="$1" alt="${1//_/-}"
             ls "$GITHUB_WORKSPACE/ib"/packages/"${n}_"*.ipk >/dev/null 2>&1 && return 0
             [ "$n" != "$alt" ] && ls "$GITHUB_WORKSPACE/ib"/packages/"${alt}_"*.ipk >/dev/null 2>&1 && return 0
             return 1
@@ -420,8 +275,7 @@ jobs:
           is_option_of_existing_pkg() {
             local cur="$1"
             while [ "$cur" != "${cur%_*}" ]; do
-              cur="${cur%_*}"
-              [ -z "$cur" ] && break
+              cur="${cur%_*}"; [ -z "$cur" ] && break
               pkg_exists "$cur" && return 0
             done
             return 1
@@ -429,76 +283,46 @@ jobs:
 
           AVAIL=""; MISSING=""
           for p in $PKGS; do
-            if pkg_exists "$p"; then
-              AVAIL="$AVAIL $p"
-            elif is_option_of_existing_pkg "$p"; then
-              continue
-            else
-              MISSING="$MISSING $p"
-            fi
+            if pkg_exists "$p"; then AVAIL="$AVAIL $p"
+            elif is_option_of_existing_pkg "$p"; then continue
+            else MISSING="$MISSING $p"; fi
           done
-
           echo "AVAIL_PKGS=$AVAIL" >> "$GITHUB_ENV"
           echo "MISSING_PKGS=$MISSING" >> "$GITHUB_ENV"
           echo "MISSING_COUNT=$(echo $MISSING | wc -w)" >> "$GITHUB_ENV"
-          echo "配置候选包 $(echo $PKGS | wc -w) 个 → 可装 $(echo $AVAIL | wc -w) 个 / 缺失 $(echo $MISSING | wc -w) 个"
-          if [ -n "$MISSING" ]; then
-            echo "----------------------------------------------------------"
-            echo "IB 中缺少以下 $(echo $MISSING | wc -w) 个包（需要编译的新插件）："
-            for p in $MISSING; do echo "  - $p"; done
-            echo "----------------------------------------------------------"
-          fi
+          echo "候选 $(echo $PKGS | wc -w) → 可装 $(echo $AVAIL | wc -w) / 缺失 $(echo $MISSING | wc -w)"
+          for p in $MISSING; do echo "  缺失: $p"; done
 
       - name: 决定构建路径
         run: |
-          MODE="${{ inputs.mode }}"
-          [ -z "$MODE" ] && MODE="auto"
-
-          echo "模式: $MODE | 内核: ${KERNEL} | IB 命中: ${IB_HIT:-0} | 缺失包: ${MISSING_COUNT:-0}"
-
-          if [ "$MODE" = "full" ]; then
+          MODE="${{ inputs.mode }}"; [ -z "$MODE" ] && MODE="auto"
+          echo "模式: $MODE | 内核: ${KERNEL} | IB: ${IB_HIT:-0} | 缺失: ${MISSING_COUNT:-0}"
+          if [ "$MODE" = "full" ] || [ "${IB_HIT:-0}" != "1" ]; then
             echo "ASSEMBLE=0" >> "$GITHUB_ENV"
-            echo "选定路径: 完整编译（mode=full 手动指定）"
-          elif [ "${IB_HIT:-0}" != "1" ]; then
-            if [ "$MODE" = "assemble" ]; then
-              echo "::error::assemble 模式但未找到匹配的 ImageBuilder"
-              echo "::error::请先以 mode=full 运行一次生成 ImageBuilder"
-              exit 1
-            fi
-            echo "ASSEMBLE=0" >> "$GITHUB_ENV"
-            echo "选定路径: 完整编译（首次运行，需生成 ImageBuilder，预计 1-3 小时）"
+            echo "路径: 完整编译"
           elif [ "${MISSING_COUNT:-0}" != "0" ]; then
-            if [ "$MODE" = "assemble" ]; then
-              echo "::error::assemble 模式但配置里有 $(echo $MISSING_PKGS | wc -w) 个包不在 ImageBuilder 中："
-              echo "::error::$MISSING_PKGS"
-              echo "::error::请改用 mode=full，让这些包被编译进 ImageBuilder"
-              exit 1
-            fi
-            # 自动转完整编译 —— 结果正确优先于速度
             echo "ASSEMBLE=0" >> "$GITHUB_ENV"
-            echo "选定路径: 完整编译（配置含 ${MISSING_COUNT} 个新包，需编译进 IB）"
-            echo "预计 20-40 分钟：已编译的包全部命中 ccache，只编译新增的这几个"
+            echo "路径: 完整编译（${MISSING_COUNT} 个新包需编译进 IB）"
           else
             echo "ASSEMBLE=1" >> "$GITHUB_ENV"
-            echo "选定路径: 组装（包齐全，预计 3-10 分钟）"
+            echo "路径: 组装（约 3-10 分钟）"
           fi
 
-      # ==================================================================
-      #  三层缓存：dl 下载 → Go/host 工具链 → ccache 编译对象
-      #  key 都绑定「配置文件内容 + 源码分支 + 源码提交」，
-      #  任一变化都会自动失效，避免命中 ABI 不兼容的旧缓存
-      # ==================================================================
-      - name: 恢复 dl 下载缓存
+          # 记录构建起点，用于统计编译/组装耗时
+          echo "BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      # ========================== 三层缓存 ==========================
+      - name: 恢复 dl 缓存
         if: ${{ env.USE_CACHE == 'true' && env.ASSEMBLE != '1' }}
         uses: actions/cache/restore@v4
         with:
           path: openwrt/dl
-          key: dl-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
+          key: dl-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
           restore-keys: |
-            dl-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-
-            dl-${{ env.DEVICE_NAME }}-
+            dl-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-
+            dl-${{ env.DEVICE }}-
 
-      - name: 恢复 Go 与 host 工具链缓存
+      - name: 恢复 Go/host 缓存
         if: ${{ env.USE_CACHE == 'true' && env.ASSEMBLE != '1' }}
         uses: actions/cache/restore@v4
         with:
@@ -507,41 +331,31 @@ jobs:
             openwrt/build_dir/hostpkg
             openwrt/tmp/go-build
             openwrt/tmp/go-mod-cache
-          key: go-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
+          key: go-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
           restore-keys: |
-            go-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-
-            go-${{ env.DEVICE_NAME }}-
+            go-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-
+            go-${{ env.DEVICE }}-
 
-      - name: 恢复 ccache 编译缓存
+      - name: 恢复 ccache
         if: ${{ env.USE_CACHE == 'true' && env.ASSEMBLE != '1' }}
         uses: actions/cache/restore@v4
         with:
           path: openwrt/.ccache
-          key: ccache-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
+          key: ccache-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
           restore-keys: |
-            ccache-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-
-            ccache-${{ env.DEVICE_NAME }}-
+            ccache-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-
+            ccache-${{ env.DEVICE }}-
 
-      - name: 配置 feeds 源（来自配置文件的 [feeds] 段）
+      - name: 配置 feeds
         if: ${{ env.ASSEMBLE != '1' }}
         run: |
           cd openwrt
-          # 顺序很重要：scripts/feeds 的 lookup_package() 按 feeds.conf 书写顺序
-          # 取第一个命中该包的源，【靠前的优先级更高】，先安装者不被后者覆盖。
-          # 因此第三方源一律追加到末尾 —— 官方源优先，第三方仅作补充。
-          env | grep -E '^FEED_[0-9]+=' | sed 's/^FEED_[0-9]*=//' | sort -t_ -k2 -n \
-            | while IFS= read -r line; do
-                [ -z "$line" ] && continue
-                # 行格式: 名字 仓库地址;分支  → 转成 src-git 名字 地址;分支
-                NAME=$(echo "$line" | awk '{print $1}')
-                URL=$(echo "$line"  | awk '{print $2}')
-                if [ -n "$NAME" ] && [ -n "$URL" ]; then
-                  echo "src-git $NAME $URL" >> feeds.conf.default
-                  echo "  + $NAME -> $URL"
-                fi
-              done
-          echo "=== 最终 feeds 配置（靠前 = 优先级高）==="
-          cat feeds.conf.default
+          echo "${{ env.FEEDS }}" | grep -v '^$' | while IFS= read -r line; do
+            NAME=$(echo "$line" | awk '{print $1}')
+            URL=$(echo "$line"  | awk '{print $2}')
+            [ -n "$NAME" ] && [ -n "$URL" ] && echo "src-git $NAME $URL" >> feeds.conf.default
+          done
+          echo "=== feeds ==="; cat feeds.conf.default
 
       - name: 更新并安装 feeds
         if: ${{ env.ASSEMBLE != '1' }}
@@ -549,12 +363,14 @@ jobs:
           cd openwrt
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          echo "=== 关键包就位校验 ==="
+          echo "=== 关键包校验 ==="
           for p in luci-app-passwall luci-theme-argon luci-app-argon-config \
                    luci-app-ssr-plus shadowsocksr-libev \
                    luci-app-store luci-lib-taskd luci-lib-xterm taskd \
-                   luci-app-ddns-go ddns-go; do
-            # istore 的包位于 luci/ 子目录，故用 -maxdepth 3
+                   luci-app-ddns-go ddns-go \
+                   luci-app-lucky lucky \
+                   luci-app-oaf appfilter \
+                   luci-app-watchcat watchcat; do
             if find package/feeds -maxdepth 3 -name "$p" -type d 2>/dev/null | grep -q .; then
               echo "  [OK]   $p"
             else
@@ -566,81 +382,100 @@ jobs:
         if: ${{ env.ASSEMBLE != '1' }}
         run: |
           cd openwrt
-          cp -f "defconfig/${DEFCONFIG}" .config
-
-          # 官方 defconfig 是 MULTI_PROFILE，一次编十几个机型。
-          # 这里改成单机型单 profile：
-          #   1. 删掉所有 CONFIG_TARGET_DEVICE_xxx 行
-          #   2. 关掉 MULTI_PROFILE 和 PER_DEVICE_ROOTFS
-          #   3. 写入本配置指定的 target / subtarget / device
+          cp -f "defconfig/${{ env.DEFCONFIG }}" .config
           sed -i '/^CONFIG_TARGET_DEVICE_/d' .config
           sed -i 's/^CONFIG_TARGET_MULTI_PROFILE=y/# CONFIG_TARGET_MULTI_PROFILE is not set/' .config
           sed -i 's/^CONFIG_TARGET_PER_DEVICE_ROOTFS=y/# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set/' .config
-          sed -i "/^CONFIG_TARGET_${TARGET}_[A-Za-z0-9_]*=y$/d" .config
-
-          # ---- 产出 ImageBuilder（完整编译时）----
-          # CONFIG_IB 默认是 BUILDBOT（通常为 n），必须显式开启才会生成。
-          # CONFIG_IB_STANDALONE 默认 y（非 BUILDBOT 时），会把【所有】编译出来的
-          # .ipk 内嵌进 ImageBuilder，之后组装时无需在线包仓库。
-          # 依据 target/imagebuilder/Makefile：STANDALONE 时执行
-          #   find $(PACKAGE_SUBDIRS) -name '*.ipk' -exec cp -t packages/ {} +
+          sed -i "/^CONFIG_TARGET_${{ env.TARGET }}_[A-Za-z0-9_]*=y$/d" .config
           echo "CONFIG_IB=y" >> .config
           echo "CONFIG_IB_STANDALONE=y" >> .config
-
           cat >> .config <<EOF
-          CONFIG_TARGET_${TARGET}=y
-          CONFIG_TARGET_${TARGET}_${SUBTARGET}=y
-          CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_${DEVICE_NAME}=y
+          CONFIG_TARGET_${{ env.TARGET }}=y
+          CONFIG_TARGET_${{ env.TARGET }}_${{ env.SUBTARGET }}=y
+          CONFIG_TARGET_${{ env.TARGET }}_${{ env.SUBTARGET }}_DEVICE_${{ env.DEVICE }}=y
           EOF
-
-          # 追加用户插件配置（去掉 ## 元数据段，只留 CONFIG_ 部分）
-          grep -v '^##' "$GITHUB_WORKSPACE/$CONFIG_DIR/$CFG" >> .config
-
+          # 追加用户插件配置（去掉空行与注释，只留 CONFIG_）
+          grep -E '^CONFIG_' "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" >> .config
           make defconfig
-
-          echo "=== 机型选择结果 ==="
-          grep -E "^CONFIG_TARGET_${TARGET}|^CONFIG_TARGET_MULTI_PROFILE" .config
-          echo "=== 关键插件确认 ==="
+          echo "=== 机型 ==="
+          grep -E "^CONFIG_TARGET_${{ env.TARGET }}|^CONFIG_TARGET_MULTI_PROFILE" .config
+          echo "=== 关键插件 ==="
           for k in luci-app-passwall luci-app-ssr-plus luci-app-store \
                    luci-app-ddns-go luci-theme-argon; do
             grep -m1 "^CONFIG_PACKAGE_${k}=" .config || echo "  $k 未启用"
           done
 
-      - name: 应用定制项（来自配置文件的 [custom] 段）
+      - name: 应用定制项
         if: ${{ env.ASSEMBLE != '1' }}
         run: |
           cd openwrt
           CFG_GEN="package/base-files/files/bin/config_generate"
-          [ -f "$CFG_GEN" ] || { echo "未找到 config_generate，跳过定制"; exit 0; }
-
-          [ -n "$LAN_IP" ] && sed -i "s/192\.168\.[0-9]\+\.1/$LAN_IP/g" "$CFG_GEN"
-          [ -n "$HOSTNAME" ] && sed -i "s/hostname='[A-Za-z0-9_-]*'/hostname='$HOSTNAME'/" "$CFG_GEN"
-          [ -n "$TZONE" ] && sed -i "s/timezone='[A-Za-z0-9+-]*'/timezone='$TZONE'/" "$CFG_GEN"
-          [ -n "$ZONENAME" ] && sed -i "s#zonename='[A-Za-z0-9/_-]*'#zonename='$ZONENAME'#" "$CFG_GEN"
-
-          # 默认主题：改 luci-base 内置配置，只在全新刷机/重置时生效，
-          # 不会在每次启动时覆盖用户选择（区别于 uci-defaults 写法）
-          if [ -n "$THEME" ]; then
+          [ -f "$CFG_GEN" ] || { echo "跳过定制"; exit 0; }
+          [ -n "${{ env.LAN_IP }}" ]    && sed -i "s/192\.168\.[0-9]\+\.1/${{ env.LAN_IP }}/g" "$CFG_GEN"
+          [ -n "${{ env.HOSTNAME }}" ]  && sed -i "s/hostname='[A-Za-z0-9_-]*'/hostname='${{ env.HOSTNAME }}'/" "$CFG_GEN"
+          [ -n "${{ env.TIMEZONE }}" ]  && sed -i "s/timezone='[A-Za-z0-9+-]*'/timezone='${{ env.TIMEZONE }}'/" "$CFG_GEN"
+          [ -n "${{ env.ZONENAME }}" ]  && sed -i "s#zonename='[A-Za-z0-9/_-]*'#zonename='${{ env.ZONENAME }}'#" "$CFG_GEN"
+          if [ -n "${{ env.THEME }}" ]; then
             LUCI_CFG=$(find feeds package -type f -path '*luci-base*' -name 'luci' \
                        -path '*etc/config*' 2>/dev/null | head -1)
             if [ -n "$LUCI_CFG" ]; then
               if grep -q 'mediaurlbase' "$LUCI_CFG"; then
-                sed -i "s|option mediaurlbase .*|option mediaurlbase '/luci-static/$THEME'|" "$LUCI_CFG"
+                sed -i "s|option mediaurlbase .*|option mediaurlbase '/luci-static/${{ env.THEME }}'|" "$LUCI_CFG"
               else
-                sed -i "/config core 'main'/a\\\toption mediaurlbase '/luci-static/$THEME'" "$LUCI_CFG"
+                sed -i "/config core 'main'/a\\\toption mediaurlbase '/luci-static/${{ env.THEME }}'" "$LUCI_CFG"
               fi
-              echo "默认主题已设为: $THEME"
             fi
           fi
           echo "=== 定制结果 ==="
-          grep -E "lan) ipad|-- set|hostname=|timezone=|zonename=" "$CFG_GEN" 2>/dev/null | head -8
+          grep -E "lan) ipad|hostname=|timezone=|zonename=" "$CFG_GEN" 2>/dev/null | head -8
 
-      - name: 执行 diy.sh（可选的高级定制）
+      # ------------------------------------------------------------------
+      # 硬件加速（HNAT / PPE）出厂默认值
+      #
+      # 改的是 turboacc 的 uci-defaults 脚本本身，而不是 /etc/config/turboacc：
+      # uci-defaults 在首次启动时会【覆盖】config 文件里的值，
+      # 只改 config 文件等于白改。
+      #
+      # 三个键的含义：
+      #   fastpath                none → init.d 检测后会写 0 到
+      #                           /sys/kernel/debug/hnat/hook_toggle 关闭 HNAT
+      #   fastpath_mh_eth_hnat    0    → 有线 HNAT 卸载关闭
+      #   fastpath_mh_eth_hnat_v6 0    → IPv6 HNAT 卸载关闭
+      #
+      # 幂等：sed 用精确键值匹配，重复执行结果一致。
+      # ------------------------------------------------------------------
+      - name: 设置硬件加速默认值
+        if: ${{ env.ASSEMBLE != '1' }}
+        run: |
+          cd openwrt
+          TA_DEF="package/mtk/applications/luci-app-turboacc-mtk/root/etc/uci-defaults/turboacc"
+
+          if [ ! -f "$TA_DEF" ]; then
+            echo "未找到 $TA_DEF，跳过（硬件加速保持源码默认）"
+            exit 0
+          fi
+
+          if [ "${{ env.HW_OFFLOAD }}" = "1" ]; then
+            sed -i 's|"turboacc.config.fastpath"="mediatek_hnat"|"turboacc.config.fastpath"="mediatek_hnat"|' "$TA_DEF"
+            sed -i 's|"turboacc.config.fastpath_mh_eth_hnat"="[01]"|"turboacc.config.fastpath_mh_eth_hnat"="1"|' "$TA_DEF"
+            sed -i 's|"turboacc.config.fastpath_mh_eth_hnat_v6"="[01]"|"turboacc.config.fastpath_mh_eth_hnat_v6"="1"|' "$TA_DEF"
+            echo "硬件加速: 开启（HNAT 生效，但代理与 OAF 将失效）"
+          else
+            sed -i 's|"turboacc.config.fastpath"="mediatek_hnat"|"turboacc.config.fastpath"="none"|' "$TA_DEF"
+            sed -i 's|"turboacc.config.fastpath_mh_eth_hnat"="[01]"|"turboacc.config.fastpath_mh_eth_hnat"="0"|' "$TA_DEF"
+            sed -i 's|"turboacc.config.fastpath_mh_eth_hnat_v6"="[01]"|"turboacc.config.fastpath_mh_eth_hnat_v6"="0"|' "$TA_DEF"
+            echo "硬件加速: 已关闭（代理 ssr-plus/passwall 与 OAF 需要）"
+          fi
+
+          echo "--- turboacc uci-defaults 实际值 ---"
+          grep -E 'turboacc.config.(fastpath|fastpath_mh_eth_hnat|fastpath_mh_eth_hnat_v6)' "$TA_DEF"
+
+      - name: 执行 diy.sh
         if: ${{ env.ASSEMBLE != '1' }}
         run: |
           cd openwrt
           if [ -f "$GITHUB_WORKSPACE/diy.sh" ]; then
-            cp "$GITHUB_WORKSPACE/diy.sh" openwrt_diy.sh 2>/dev/null || true
+            cp "$GITHUB_WORKSPACE/diy.sh" openwrt_diy.sh
             chmod +x openwrt_diy.sh
             ./openwrt_diy.sh
           else
@@ -655,109 +490,98 @@ jobs:
           find dl -size -1024c -exec rm -f {} \;
 
       - name: 编译固件
+        id: compile
         if: ${{ env.ASSEMBLE != '1' }}
         run: |
           cd openwrt
-          ccache -M "$CCACHE_MAXSIZE" 2>/dev/null || true
+          ccache -M "${{ env.CCACHE_MAXSIZE }}" 2>/dev/null || true
           make -j$(nproc) || make -j1 V=s
-          echo "=== ccache 统计 ==="
           ccache -s 2>/dev/null | head -12 || true
 
-      # ==================================================================
-      #  【组装模式】用 ImageBuilder 直接拼固件，不编译任何东西
-      #  耗时约 3-10 分钟，与完整编译的 1-3 小时形成对比
-      # ==================================================================
+      # ======================== 组装模式 ========================
       - name: 安装组装工具
         if: ${{ env.ASSEMBLE == '1' }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            zstd xz-utils tar python3 file rsync
+          sudo apt-get install -y --no-install-recommends zstd xz-utils tar python3 file rsync
           sudo apt-get clean
 
-      - name: 确认机型 profile
+      - name: 确认 profile
         if: ${{ env.ASSEMBLE == '1' }}
         run: |
           cd "$GITHUB_WORKSPACE/ib"
-          make info 2>/dev/null | grep -iE "^${DEVICE_NAME}:" || true
-          echo "--- 全部可用 profile ---"
+          make info 2>/dev/null | grep -iE "^${{ env.DEVICE }}:" || true
+          echo "--- 全部 profile ---"
           make info 2>/dev/null | grep -E '^[a-z0-9_-]+:' | head -30
 
-      - name: 准备定制文件（FILES 注入）
+      - name: 准备定制文件
         if: ${{ env.ASSEMBLE == '1' }}
         run: |
-          # ImageBuilder 没有源码树，定制走 FILES 注入 + uci-defaults
-          # （uci-defaults 只在首次启动执行一次，与源码树改法等效）
           D="$GITHUB_WORKSPACE/ibfiles/etc/uci-defaults"
           mkdir -p "$D"
-          cat > "$D/99-custom" <<EOF
+
+          # ⚠ 文件名必须是 zzz-custom 而非 99-custom：
+          #   OpenWrt 的 uci-defaults 按【文件名排序】执行，
+          #   '9'(ASCII 57) < 't'(116)，所以 99-custom 会先于包自带的
+          #   turboacc 执行，随后被 turboacc 覆盖 —— 设置等于白写。
+          #   zzz- 开头确保排在最后，覆盖 turboacc 的默认值。
+          if [ "${{ env.HW_OFFLOAD }}" = "1" ]; then
+            HW_FP=mediatek_hnat
+            HW_HNAT=1
+            HW_HNAT_V6=1
+          else
+            HW_FP=none
+            HW_HNAT=0
+            HW_HNAT_V6=0
+          fi
+
+          cat > "$D/zzz-custom" <<EOF
           #!/bin/sh
           uci -q batch <<'EOC'
-          set network.lan.ipaddr='${LAN_IP}'
-          set system.@system[0].hostname='${HOSTNAME}'
-          set system.@system[0].timezone='${TZONE}'
-          set system.@system[0].zonename='${ZONENAME}'
-          set luci.main.mediaurlbase='/luci-static/${THEME}'
+          set network.lan.ipaddr='${{ env.LAN_IP }}'
+          set system.@system[0].hostname='${{ env.HOSTNAME }}'
+          set system.@system[0].timezone='${{ env.TIMEZONE }}'
+          set system.@system[0].zonename='${{ env.ZONENAME }}'
+          set luci.main.mediaurlbase='/luci-static/${{ env.THEME }}'
+          set turboacc.config.fastpath='${HW_FP}'
+          set turboacc.config.fastpath_mh_eth_hnat='${HW_HNAT}'
+          set turboacc.config.fastpath_mh_eth_hnat_v6='${HW_HNAT_V6}'
           commit
           EOC
           exit 0
           EOF
-          chmod +x "$D/99-custom"
-          echo "=== 注入的定制 ==="; cat "$D/99-custom"
+          chmod +x "$D/zzz-custom"
+          echo "硬件加速: ${HW_FP}"
+          cat "$D/zzz-custom"
 
       - name: 组装固件
+        id: assemble
         if: ${{ env.ASSEMBLE == '1' }}
         run: |
           cd "$GITHUB_WORKSPACE/ib"
-
-          # 直接复用「解压 ImageBuilder 并检测包完整性」步骤算好的结果，
-          # 避免同一套判定逻辑在两处各写一遍、改一处漏一处。
-          AVAIL="$AVAIL_PKGS"
-          echo "待装包: $(echo $AVAIL | wc -w) 个"
-
-          # 走到这里本不该有缺失（前面已检测，有缺失会自动转完整编译）。
-          # 若仍出现说明 IB 状态与检测时不一致，必须中止而非产出缺包固件。
           if [ "${MISSING_COUNT:-0}" != "0" ]; then
-            echo "::error::以下 $(echo $MISSING_PKGS | wc -w) 个包不在 ImageBuilder 中："
-            for p in $MISSING_PKGS; do echo "::error::  - $p"; done
-            echo "::error::中止组装，避免产出缺少插件的固件。请以 mode=full 运行一次。"
+            echo "::error::${MISSING_COUNT} 个包不在 IB 中，请以 mode=full 运行"
             exit 1
           fi
-
-          mkdir -p "$GITHUB_WORKSPACE/openwrt/bin/targets/$TARGET/$SUBTARGET"
-
-          # 组装模式没有源码树 .config，把机型配置放过去，
-          # 供 Release 正文生成脚本在 manifest 缺失时回退读取
-          cp -f "$GITHUB_WORKSPACE/$CONFIG_DIR/$CFG" "$GITHUB_WORKSPACE/openwrt/.config"
-
+          mkdir -p "$GITHUB_WORKSPACE/openwrt/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}"
+          cp -f "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" "$GITHUB_WORKSPACE/openwrt/.config"
           make image \
-            PROFILE="$DEVICE_NAME" \
-            PACKAGES="$AVAIL" \
+            PROFILE="${{ env.DEVICE }}" \
+            PACKAGES="$AVAIL_PKGS" \
             FILES="$GITHUB_WORKSPACE/ibfiles" \
-            BIN_DIR="$GITHUB_WORKSPACE/openwrt/bin/targets/$TARGET/$SUBTARGET" \
+            BIN_DIR="$GITHUB_WORKSPACE/openwrt/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}" \
             EXTRA_IMAGE_NAME="assembled"
+          ls -lh "$GITHUB_WORKSPACE/openwrt/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}"
 
-          echo "=== 组装产物 ==="
-          ls -lh "$GITHUB_WORKSPACE/openwrt/bin/targets/$TARGET/$SUBTARGET"
-
-      - name: 组装失败排查提示
-        if: ${{ failure() && env.ASSEMBLE == '1' }}
-        run: |
-          echo "::error::组装失败。常见原因："
-          echo "::error::1. 配置文件里有 ImageBuilder 中不存在的包 —— 该包在生成 IB 的那次完整编译时没被编译"
-          echo "::error::   解决：先以 mode=full 跑一次，让新包进入 IB 包仓库"
-          echo "::error::2. PROFILE 名不匹配 —— 见上方 '确认机型 profile' 步骤的实际列表"
-          echo "::error::3. 磁盘空间不足（IB 解压后较大）"
-          df -hT
-
+      # ======================== 保存缓存 ========================
       - name: 保存 dl 缓存
         if: ${{ always() && env.USE_CACHE == 'true' && env.ASSEMBLE != '1' }}
         uses: actions/cache/save@v4
         with:
           path: openwrt/dl
-          key: dl-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
+          key: dl-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
 
-      - name: 保存 Go 与 host 工具链缓存
+      - name: 保存 Go/host 缓存
         if: ${{ always() && env.USE_CACHE == 'true' && env.ASSEMBLE != '1' }}
         uses: actions/cache/save@v4
         with:
@@ -766,67 +590,92 @@ jobs:
             openwrt/build_dir/hostpkg
             openwrt/tmp/go-build
             openwrt/tmp/go-mod-cache
-          key: go-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
+          key: go-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
 
-      - name: 保存 ccache 编译缓存
+      - name: 保存 ccache
         if: ${{ always() && env.USE_CACHE == 'true' && env.ASSEMBLE != '1' }}
         uses: actions/cache/save@v4
         with:
           path: openwrt/.ccache
-          key: ccache-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
+          key: ccache-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
 
-      # ImageBuilder 是完整编译的副产物，保存下来供 assemble 模式复用。
-      # key 刻意【不含】CFG_HASH —— 只要机型与分支不变就能复用，
-      # 这样调整插件清单（配置文件）时不必重新完整编译。
-      # 代价：新增此前没编译过的包时，需手动跑一次 full 重建 IB。
-      - name: 保存 ImageBuilder（供组装模式复用）
+      - name: 保存 ImageBuilder
         if: ${{ success() && env.ASSEMBLE != '1' }}
         uses: actions/cache/save@v4
         with:
           path: openwrt/bin/targets/*/*/*imagebuilder*.tar.zst
-          key: ib-${{ env.DEVICE_NAME }}-${{ env.REPO_BRANCH }}-${{ env.KERNEL }}
+          key: ib-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.KERNEL }}
 
+      # ======================== 整理产物 ========================
       - name: 整理产物
         run: |
           cd openwrt
           echo "FILE_DATE=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')" >> "$GITHUB_ENV"
           mkdir -p "$GITHUB_WORKSPACE/artifact"
-          cp -f bin/targets/*/*/*${DEVICE_NAME}*.bin "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
-          cp -f bin/targets/*/*/*.manifest  "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
-          cp -f bin/targets/*/*/config.buildinfo "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
-          cp -f bin/targets/*/*/sha256sums  "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -f bin/targets/*/*/*${{ env.DEVICE }}*.bin "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -f bin/targets/*/*/*.manifest "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -f bin/targets/*/*/sha256sums "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
           cp -f .config "$GITHUB_WORKSPACE/artifact/full.config" 2>/dev/null || true
-          cp -f "$GITHUB_WORKSPACE/$CONFIG_DIR/$CFG" "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
-          # ImageBuilder 体积较大，默认不进 Release，只随 Artifacts 留存 90 天；
-          # 需要时可自行下载后在本地跑 make image 组装。
+          cp -f "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
           cp -f bin/targets/*/*/*imagebuilder*.tar.zst "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
           ls -lh "$GITHUB_WORKSPACE/artifact"
 
-      - name: 上传到 Artifacts（短期镜像，90 天）
+      - name: 上传 Artifacts（90 天）
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-${{ env.DEVICE_NAME }}-${{ env.FILE_DATE }}
+          name: immortalwrt-${{ env.DEVICE }}-${{ env.FILE_DATE }}
           path: artifact/*
           retention-days: 90
           if-no-files-found: error
 
       - name: 生成 Release 正文
+        env:
+          BUILD_START: ${{ env.BUILD_START }}
         run: |
           cd openwrt
           chmod +x "$GITHUB_WORKSPACE/gen-release-notes.sh"
+
+          # 版本号：读取仓库 VERSION 文件第一行
+          VERSION_TAG=$(head -1 "$GITHUB_WORKSPACE/VERSION" 2>/dev/null | tr -d ' \t\r')
+          [ -z "$VERSION_TAG" ] && VERSION_TAG="unknown"
+          export VERSION_TAG
+
+          # 构建耗时：优先用 Actions 原生计时（精确），缺失时回退到自计时
+          fmt_dur() {
+            local ms="$1"
+            [ -z "$ms" ] || [ "$ms" = "null" ] && return 1
+            local s=$(( ms / 1000 ))
+            [ "$s" -le 0 ] && return 1
+            local h=$(( s / 3600 )) m=$(( (s % 3600) / 60 )) sec=$(( s % 60 ))
+            if   [ "$h" -gt 0 ]; then echo "${h} 小时 ${m} 分"
+            elif [ "$m" -gt 0 ]; then echo "${m} 分 ${sec} 秒"
+            else                      echo "${sec} 秒"
+            fi
+          }
+          if [ "${{ env.ASSEMBLE }}" = "1" ]; then
+            DUR=$(fmt_dur "${{ steps.assemble.duration_ms }}" || true)
+          else
+            DUR=$(fmt_dur "${{ steps.compile.duration_ms }}" || true)
+          fi
+          if [ -z "$DUR" ] && [ -n "${BUILD_START:-}" ]; then
+            ELAPSED=$(( $(date +%s) - BUILD_START ))
+            [ "$ELAPSED" -gt 0 ] && DUR=$(fmt_dur $(( ELAPSED * 1000 )) || true)
+          fi
+          export BUILD_DURATION="${DUR:-未知}"
+          echo "版本: $VERSION_TAG | 构建耗时: $BUILD_DURATION"
+
           export HEAD_SHORT="${{ needs.check.outputs.head_short }}"
           export HEAD_DATE="${{ needs.check.outputs.head_date }}"
           export HEAD_MSG="${{ needs.check.outputs.head_msg }}"
           export TRIGGER_REASON="${{ needs.check.outputs.reason }}"
           "$GITHUB_WORKSPACE/gen-release-notes.sh" "$GITHUB_WORKSPACE/release-notes.md"
-          echo "--- 正文预览 ---"
           head -40 "$GITHUB_WORKSPACE/release-notes.md"
 
-      - name: 发布到 Release（永久保留）
+      - name: 发布 Release（永久保留）
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ env.DEVICE_NAME }}-${{ env.FILE_DATE }}-r${{ github.run_number }}
-          name: ${{ env.DEVICE_NAME }} · ImmortalWrt · kernel ${{ env.KERNEL }} · ${{ env.FILE_DATE }} ${{ env.ASSEMBLE == '1' && '· 组装' || '· 完整编译' }}
+          tag_name: ${{ env.DEVICE }}-${{ env.FILE_DATE }}-r${{ github.run_number }}
+          name: ${{ env.DEVICE }} · ImmortalWrt · kernel ${{ env.KERNEL }} · ${{ env.FILE_DATE }} ${{ env.ASSEMBLE == '1' && '· 组装' || '· 完整编译' }}
           body_path: ${{ github.workspace }}/release-notes.md
           draft: false
           prerelease: false
@@ -835,27 +684,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 失败时开启 SSH 调试
-        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.enable_ssh }}
-        uses: mxschmitt/action-tmate@v3
-        timeout-minutes: 30
-
-  # ------------------------------------------------------------------
-  # 构建成功后记录提交号；失败则不写，下个周期自动重试
-  # ------------------------------------------------------------------
   update-state:
     needs: [check, build]
     if: ${{ always() && needs.check.outputs.should_build == 'true' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - name: 写入已构建提交记录
+      - name: 记录已构建提交
         uses: actions/github-script@v8
         with:
           script: |
-            const device = '${{ needs.check.outputs.device }}';
             const sha = '${{ needs.check.outputs.head_sha }}';
-            const path = `.upstream-commit-${device}`;
-
+            const path = '${{ env.STATE_FILE }}';
             const content = Buffer.from(`${sha}\n`).toString('base64');
             let fileSha;
             try {
@@ -869,14 +708,12 @@ jobs:
             } catch (e) {
               if (e.status !== 404) throw e;
             }
-
             await github.rest.repos.createOrUpdateFileContents({
               owner: context.repo.owner,
               repo: context.repo.repo,
               path,
               branch: context.payload.repository.default_branch,
-              message: `chore: record built upstream commit ${sha.slice(0, 7)} for ${device}`,
+              message: `chore: record built commit ${sha.slice(0, 7)}`,
               content,
               ...(fileSha ? { sha: fileSha } : {}),
             });
-            core.info(`已记录 ${device} 的上游提交 ${sha.slice(0, 7)}`);
