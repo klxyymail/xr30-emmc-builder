@@ -9,7 +9,7 @@
 #
 #  简单的定制（IP / 主机名 / 主题）在 workflow 的 env 段改，不用写在这里。
 #
-#  ⚠ 以下两项均已启用。每项都做了存在性检查：
+#  ⚠ 各项均做了存在性检查：
 #     条件不满足 → 打印警告并跳过，绝不会中断构建（脚本开头有 set -e）。
 # ============================================================================
 
@@ -19,7 +19,48 @@ echo "===== diy.sh 开始 ====="
 DTS="target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc-mtk.dts"
 
 # --------------------------------------------------------------
-# 一、替换 WiFi EEPROM（提升发射功率）
+# 一、修复 libffi 3.4.7 编译失败（上游兼容性问题）
+#
+#   现象：构建在 libffi 处中断
+#     cp: cannot stat '.../libffi-3.4.7/aarch64-openwrt-linux*/fficonfig.h':
+#          No such file or directory
+#     ERROR: package/feeds/packages/libffi failed to build.
+#
+#   原因：OpenWrt 24.10 分支的 libffi Makefile 里，Build/InstallDev 仍保留
+#         旧版写法，尝试从 $(GNU_TARGET_NAME)*/ 子目录拷贝 fficonfig.h。
+#         但 libffi 3.4.7 起：
+#           · fficonfig.h 不再生成于该架构子目录
+#           · 也【不】被 make install 安装到 $(includedir)
+#             （include/Makefile.am: nodist_include_HEADERS = ffi.h ffitarget.h）
+#         于是通配路径匹配不到，cp 报错，整个构建中断。
+#
+#   修复：删除该行（与 OpenWrt 官方 master 的做法完全一致）。
+#   安全性：已核对 libffi 3.4.7 的 ffi.h.in 只 include <ffitarget.h>、
+#           <stddef.h>、<limits.h>，并不依赖 fficonfig.h，
+#           因此不安装 fficonfig.h 不会影响任何下游包。
+#
+#   幂等：先检测该行是否存在，已删除则跳过。
+# --------------------------------------------------------------
+echo "--- [1/3] 上游兼容性修复（libffi）---"
+LF_MK="feeds/packages/libs/libffi/Makefile"
+
+if [ ! -f "$LF_MK" ]; then
+    echo "  [跳过] 未找到 $LF_MK"
+elif ! grep -q 'GNU_TARGET_NAME)\*/fficonfig\.h' "$LF_MK"; then
+    echo "  [无需修改] 该行不存在（上游可能已修复）"
+else
+    perl -0777 -i -pe \
+      's/\t\$\(CP\) \\\n\t\t\$\(PKG_BUILD_DIR\)\/\$\(GNU_TARGET_NAME\)\*\/fficonfig\.h \\\n\t\t\$\(1\)\/usr\/include\/\n//' \
+      "$LF_MK"
+    if grep -q 'GNU_TARGET_NAME)\*/fficonfig\.h' "$LF_MK"; then
+        echo "  [警告] 未能删除 fficonfig.h 行，构建可能失败"
+    else
+        echo "  [已修复] 移除 fficonfig.h 拷贝（对齐 OpenWrt master）"
+    fi
+fi
+
+# --------------------------------------------------------------
+# 二、替换 WiFi EEPROM（提升发射功率）
 #
 #   背景：原厂 2.4G 23dBm / 5G 22dBm，替换 eeprom 后可到 25dBm / 24dBm
 #
@@ -30,7 +71,7 @@ DTS="target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc-mtk.dts"
 #   ⚠ 刷错 eeprom 会导致 WiFi 无法启动或功率异常，请先备份原厂分区。
 #     没有提供文件时本段会安全跳过，不影响构建。
 # --------------------------------------------------------------
-echo "--- [1/2] WiFi EEPROM ---"
+echo "--- [2/3] WiFi EEPROM ---"
 EEPROM_SRC="$GITHUB_WORKSPACE/eeprom/mt7981_eeprom.bin"
 EEPROM_DST="feeds/mtk/mtk_wifi/files/lib/firmware/mt7981_eeprom_mt7976_dbdc.bin"
 
@@ -45,7 +86,7 @@ else
 fi
 
 # --------------------------------------------------------------
-# 二、修正 LED 定义（XR30 eMMC 专用）
+# 三、修正 LED 定义（XR30 eMMC 专用）
 #
 #   背景：当前设备目标是 cmcc_rax3000m-emmc-mtk，
 #         DTS 里定义了三个 LED（绿 GPIO9 / 蓝 GPIO12 / 红 GPIO35），
@@ -68,7 +109,7 @@ fi
 #       若需降频（部分机器 52MHz 不稳），自行在下方加：
 #         sed -i 's/max-frequency = <52000000>/max-frequency = <26000000>/' "$DTS"
 # --------------------------------------------------------------
-echo "--- [2/2] LED 定义 ---"
+echo "--- [3/3] LED 定义 ---"
 LED_FIX=1
 
 if [ "$LED_FIX" != "1" ]; then
