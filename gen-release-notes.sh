@@ -7,7 +7,7 @@
 #
 #  依赖的环境变量（由 workflow 注入）:
 #    REPO_URL REPO_BRANCH DEVICE_NAME FILE_DATE KERNEL
-#    HEAD_SHORT HEAD_DATE HEAD_MSG TRIGGER_REASON CHANGE_FILES
+#    HEAD_SHORT HEAD_DATE HEAD_MSG TRIGGER_REASON
 #
 #  数据来源（按优先级）:
 #    1) bin/targets/<target>/<subtarget>/*.manifest
@@ -268,18 +268,6 @@ emit_list_section "常用工具" \
 if [ "$SECTION_COUNT" -eq 0 ]; then
     echo "" >> "$OUT"
     echo "_（未检测到匹配的插件）_" >> "$OUT"
-fi
-
-# ---- 配置变更 ----
-if [ -n "$CHANGE_FILES" ]; then
-    {
-        echo ""
-        echo "## 触发本次构建的配置变更"
-        echo ""
-        echo '```'
-        echo "$CHANGE_FILES"
-        echo '```'
-    } >> "$OUT"
 fi
 
 # ---- 固定提示 ----
