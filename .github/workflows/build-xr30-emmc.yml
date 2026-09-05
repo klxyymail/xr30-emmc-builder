@@ -1,0 +1,465 @@
+name: Build ImmortalWrt 24.10 (k6.6) for CMCC XR30 eMMC
+
+on:
+  # ------------------------------------------------------------------------
+  # 手动触发：总是构建（用户主动点击即视为要求出包）
+  # ------------------------------------------------------------------------
+  workflow_dispatch:
+    inputs:
+      enable_ssh:
+        description: '编译失败时开启 SSH 调试 (tmate)'
+        required: false
+        default: false
+        type: boolean
+      use_ccache:
+        description: '使用 ccache 加速（强烈建议开启）'
+        required: false
+        default: true
+        type: boolean
+
+  # ------------------------------------------------------------------------
+  # 配置变更触发：改了下面任一文件就自动重新编译
+  #   plugins.config        插件增删
+  #   diy.sh                定制项（默认 IP、主机名、额外包）
+  #   gen-release-notes.sh  Release 正文生成逻辑
+  #   build-xr30-emmc.yml   构建流程本身（机型、分支、定时等）
+  #
+  # 注：workflow 用 GITHUB_TOKEN 回写 .upstream-commit 不会触发新的 workflow，
+  #     GitHub 有意这样设计以防止递归，所以不会自激。
+  # ------------------------------------------------------------------------
+  push:
+    branches: [main, master]
+    paths:
+      - 'plugins.config'
+      - 'diy.sh'
+      - 'gen-release-notes.sh'
+      - '.github/workflows/build-xr30-emmc.yml'
+
+  # ------------------------------------------------------------------------
+  # 定时触发：仅在检测到上游有新提交时才构建
+  # UTC 周二 02:00 = 北京时间周二 10:00
+  # 注意：GitHub 不保证定时精确执行，负载高时可能延迟数十分钟
+  # ------------------------------------------------------------------------
+  schedule:
+    - cron: '0 2 * * 2'
+
+permissions:
+  contents: write
+
+# 同一时间只允许一个构建在跑，避免定时任务与手动触发打架
+concurrency:
+  group: build-xr30-emmc
+  cancel-in-progress: false
+
+env:
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
+  REPO_BRANCH: openwrt-24.10-6.6
+  UPSTREAM_OWNER: padavanonly
+  UPSTREAM_REPO: immortalwrt-mt798x-6.6
+  # XR30 eMMC 与 RAX3000M eMMC 算力版硬件相同，本仓库没有 cmcc_xr30-emmc 这个设备目标，
+  # 对应目标是 cmcc_rax3000m-emmc-mtk（MTK layout，出 sysupgrade-tar 格式 .bin）
+  DEVICE_NAME: cmcc_rax3000m-emmc-mtk
+  SUBTARGET: filogic
+  DEFCONFIG: mt7981-ax3000.config
+  STATE_FILE: .upstream-commit
+  TZ: Asia/Shanghai
+
+jobs:
+  # ------------------------------------------------------------------
+  # 检测上游是否有新提交
+  # ------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.changed }}
+      head_sha: ${{ steps.fetch.outputs.sha }}
+      head_short: ${{ steps.fetch.outputs.short }}
+      head_msg: ${{ steps.fetch.outputs.msg }}
+      head_date: ${{ steps.fetch.outputs.date }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - name: 获取上游最新提交
+        id: fetch
+        run: |
+          set -e
+          SHA=$(git ls-remote "$REPO_URL" "refs/heads/$REPO_BRANCH" | awk '{print $1}')
+          if [ -z "$SHA" ]; then
+            echo "无法获取上游分支 $REPO_BRANCH 的提交号"; exit 1
+          fi
+          echo "上游 HEAD: $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$(echo "$SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+          # 拿到提交信息与日期（读公开仓库，带 token 提高限流额度）
+          API="https://api.github.com/repos/$UPSTREAM_OWNER/$UPSTREAM_REPO/commits/$SHA"
+          JSON=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                      -H "Accept: application/vnd.github+json" "$API" || true)
+
+          # commit message 只取首行并截断，避免特殊字符破坏 Release 正文
+          MSG=$(echo "$JSON" | jq -r '.commit.message // ""' 2>/dev/null | head -n1 | cut -c1-200 | tr -d '`${}' || true)
+          DATE=$(echo "$JSON" | jq -r '.commit.author.date // ""' 2>/dev/null || true)
+          echo "msg=${MSG:-（未获取到提交信息）}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE:-未知}" >> "$GITHUB_OUTPUT"
+
+      - name: 与已构建记录比对
+        id: decide
+        uses: actions/github-script@v7
+        env:
+          STATE_FILE: ${{ env.STATE_FILE }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const branch = context.payload.repository.default_branch;
+            const stateFile = process.env.STATE_FILE;
+            const sha = '${{ steps.fetch.outputs.sha }}';
+
+            let prev = '';
+            let prevShaForUpdate = undefined;
+            try {
+              const { data } = await github.rest.repos.getContent({
+                owner, repo, path: stateFile, ref: branch
+              });
+              prev = Buffer.from(data.content, 'base64').toString('utf8').trim();
+              prevShaForUpdate = data.sha;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+
+            const isScheduled = context.eventName === 'schedule';
+            const changed = prev !== sha;
+
+            core.info(`事件类型: ${context.eventName}`);
+            core.info(`已构建记录: ${prev || '（无，首次运行）'}`);
+            core.info(`上游最新:   ${sha}`);
+            core.info(`是否有更新: ${changed}`);
+
+            let shouldBuild;
+            let reason = '';
+            if (context.eventName === 'workflow_dispatch') {
+              shouldBuild = true;
+              reason = '手动触发';
+              core.info('手动触发，跳过更新检测');
+            } else if (context.eventName === 'push') {
+              shouldBuild = true;
+              reason = '配置变更';
+              core.info('检测到配置文件变更，重新构建');
+            } else if (changed) {
+              shouldBuild = true;
+              reason = '上游有更新';
+              core.info('检测到上游新提交，开始构建');
+            } else {
+              shouldBuild = false;
+              reason = '上游无更新，跳过';
+              core.info('上游无新提交，跳过本次构建');
+            }
+
+            core.setOutput('changed', String(shouldBuild));
+            core.setOutput('prev', prev);
+            core.setOutput('prev_file_sha', prevShaForUpdate || '');
+            core.setOutput('reason', reason);
+
+            const summary = [
+              '## 构建决策',
+              '',
+              '| 项目 | 值 |',
+              '| --- | --- |',
+              `| 触发事件 | \`${context.eventName}\` |`,
+              `| 触发原因 | ${reason} |`,
+              `| 上游分支 | \`${process.env.REPO_BRANCH}\` |`,
+              `| 已构建提交 | \`${(prev || '无').slice(0, 7)}\` |`,
+              `| 上游最新提交 | \`${sha.slice(0, 7)}\` |`,
+              `| 是否有更新 | ${changed ? '是' : '否'} |`,
+              `| 本次动作 | ${shouldBuild ? '**构建固件**' : '跳过'} |`,
+            ].join('\n');
+            await core.summary.addRaw(summary).write();
+
+  # ------------------------------------------------------------------
+  # 编译固件
+  # ------------------------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    env:
+      # 定时构建默认开启 ccache；手动构建由 use_ccache 输入决定
+      USE_CCACHE: ${{ github.event_name == 'schedule' || inputs.use_ccache }}
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: 构建环境信息
+        run: |
+          echo "CPU核心: $(nproc)"
+          free -h
+          df -hT /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext \
+            gcc-multilib g++-multilib git gnutls-dev gperf haveged help2man intltool \
+            lib32gcc-s1 libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build p7zip \
+            p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+            python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig \
+            texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+          sudo apt-get clean
+
+      - name: 拉取源码
+        run: |
+          git clone --depth 1 --single-branch -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          cd openwrt
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "KERNEL=$(grep -m1 'LINUX_VERSION-6.6 =' include/kernel-6.6 2>/dev/null | awk '{print $3}')" >> "$GITHUB_ENV"
+
+      - name: 恢复 ccache
+        if: ${{ env.USE_CCACHE }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.DEVICE_NAME }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.DEVICE_NAME }}-
+
+      - name: 配置 feeds 源（追加 helloworld + istore）
+        run: |
+          cd openwrt
+          # 顺序很重要：scripts/feeds 的 lookup_package() 按 feeds.conf 文件的书写顺序
+          # 取第一个命中该包的源，即【靠前的源优先级更高】，且先安装者不被后者覆盖。
+          # 因此两个第三方源都放在最后 —— immortalwrt 官方源优先，只有官方源没有的包
+          # 才由第三方提供，避免覆盖与 24.10 匹配的官方包版本（xray-core、chinadns-ng 等）。
+          #
+          # helloworld 提供: luci-app-ssr-plus / shadowsocksr-libev / shadowsocks-libev /
+          #                  mosdns / dnsproxy / dns2socks-rust / gn
+          # istore    提供: luci-app-store / luci-lib-taskd / luci-lib-xterm / taskd
+          #
+          # 两个第三方源之间【无任何同名包】，故彼此先后顺序不影响结果。
+          #
+          # 注：以下包在官方源已内置，无需额外加源：
+          #   luci-app-passwall / luci-theme-argon / luci-app-argon-config / luci-app-ddns-go
+          #
+          # 注：linkease/istore 的包藏在 luci/ 子目录下（非顶层），但 include/scan.mk
+          #     用 "find -L $(SCAN_DIR) -mindepth 1 -name Makefile" 递归扫描、无 maxdepth
+          #     限制，因此仍能被正确发现。
+          echo "src-git helloworld https://github.com/fw876/helloworld.git;dev" >> feeds.conf.default
+          echo "src-git istore https://github.com/linkease/istore.git;main" >> feeds.conf.default
+          echo "=== 最终 feeds 配置（靠前 = 优先级高）==="
+          cat feeds.conf.default
+
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "=== 校验关键包是否已就位 ==="
+          for p in luci-app-passwall luci-theme-argon luci-app-argon-config \
+                   luci-app-ssr-plus shadowsocksr-libev \
+                   luci-app-store luci-lib-taskd luci-lib-xterm taskd \
+                   luci-app-ddns-go ddns-go; do
+            # istore 的包位于 luci/ 子目录，故用 -maxdepth 3
+            if [ -d "package/feeds" ] && find package/feeds -maxdepth 3 -name "$p" -type d | grep -q .; then
+              echo "  [OK]      $p -> $(find package/feeds -maxdepth 3 -name "$p" -type d | head -1)"
+            else
+              echo "  [缺失]    $p"
+            fi
+          done
+
+      - name: 载入机型配置
+        run: |
+          cd openwrt
+          cp -f "defconfig/${DEFCONFIG}" .config
+
+          # 官方 defconfig 是 MULTI_PROFILE，一次编 17 个机型（且 subtarget 字段是失效的
+          # mt7981 旧写法）。这里改成单机型单 profile：
+          #   1. 删掉所有 CONFIG_TARGET_DEVICE_xxx =y / _PACKAGES_xxx= 行
+          #   2. 关掉 MULTI_PROFILE 和 PER_DEVICE_ROOTFS
+          #   3. 写入 filogic subtarget + XR30 eMMC 对应的设备目标
+          sed -i '/^CONFIG_TARGET_DEVICE_/d' .config
+          sed -i 's/^CONFIG_TARGET_MULTI_PROFILE=y/# CONFIG_TARGET_MULTI_PROFILE is not set/' .config
+          sed -i 's/^CONFIG_TARGET_PER_DEVICE_ROOTFS=y/# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set/' .config
+          sed -i '/^CONFIG_TARGET_mediatek_mt798[16]=y/d' .config
+
+          cat >> .config <<EOF
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_${SUBTARGET}=y
+          CONFIG_TARGET_mediatek_${SUBTARGET}_DEVICE_${DEVICE_NAME}=y
+          EOF
+
+          make defconfig
+
+          echo "=== 机型选择结果 ==="
+          grep -E '^(CONFIG_TARGET_mediatek|CONFIG_TARGET_MULTI_PROFILE|CONFIG_TARGET_PER_DEVICE_ROOTFS)' .config
+          echo "=== 选中设备的固件输出名 ==="
+          grep -E "^CONFIG_TARGET_DEVICE_mediatek_${SUBTARGET}_DEVICE_.*=y" .config || echo "单 profile 模式（无 CONFIG_TARGET_DEVICE_ 行，属正常）"
+
+      - name: 追加插件配置（ssr-plus / passwall / argon）
+        run: |
+          cd openwrt
+          if [ -f "$GITHUB_WORKSPACE/plugins.config" ]; then
+            cat "$GITHUB_WORKSPACE/plugins.config" >> .config
+            make defconfig
+            echo "=== 插件配置生效校验 ==="
+            for k in luci-app-passwall luci-theme-argon luci-app-argon-config \
+                     luci-app-ssr-plus dnsmasq_full xray-core chinadns-ng \
+                     v2ray-geoip v2ray-geosite geoview; do
+              v=$(grep -m1 "^CONFIG_PACKAGE_${k}=" .config || echo "未启用")
+              echo "  ${k}: ${v}"
+            done
+            echo "=== 确认 dnsmasq 已被 dnsmasq-full 替换 ==="
+            grep -E '^CONFIG_PACKAGE_dnsmasq' .config || true
+          else
+            echo "未发现 plugins.config，跳过插件配置"
+          fi
+
+      - name: 执行自定义脚本（可选，最后执行，可覆盖上述所有配置）
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/diy.sh" ]; then
+            cp "$GITHUB_WORKSPACE/diy.sh" openwrt/diy.sh
+            cd openwrt && chmod +x diy.sh && ./diy.sh
+          else
+            echo "未发现 diy.sh，跳过自定义步骤"
+          fi
+
+      - name: 下载源码包
+        run: |
+          cd openwrt
+          make download -j$(nproc) || make download -j1 V=s
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 编译固件
+        run: |
+          cd openwrt
+          if [ "${USE_CCACHE}" = "true" ]; then
+            export CCACHE_DIR="$HOME/.ccache"
+            ccache -M 5G
+            echo "ccache 已启用"
+          fi
+          make -j$(nproc) || make -j1 V=s
+
+      - name: 整理产物
+        run: |
+          cd openwrt
+          echo "FILE_DATE=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M')" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/artifact"
+          cp -f bin/targets/mediatek/filogic/*${DEVICE_NAME}*.bin "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -f bin/targets/mediatek/filogic/*.manifest "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -f bin/targets/mediatek/filogic/config.buildinfo "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -f bin/targets/mediatek/filogic/sha256sums "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -f .config "$GITHUB_WORKSPACE/artifact/full.config" 2>/dev/null || true
+          # 本仓库 plugins.config / diy.sh 一并归档，便于追溯该固件用的是哪套配置
+          cp -f "$GITHUB_WORKSPACE/plugins.config" "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          cp -f "$GITHUB_WORKSPACE/diy.sh" "$GITHUB_WORKSPACE/artifact/" 2>/dev/null || true
+          ls -lh "$GITHUB_WORKSPACE/artifact"
+
+      # ======================================================================
+      #  Release 是固件的【永久存储】位置，Artifacts 只是短期镜像。
+      #  GitHub 不会自动删除 Release 及其附件；本仓库也刻意不配置任何
+      #  清理旧 Release 的流程。请勿另行添加 delete-older-releases 类动作。
+      # ======================================================================
+      - name: 上传到 Artifacts（短期镜像，最长 90 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-xr30-emmc-${{ env.FILE_DATE }}
+          path: artifact/*
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: 生成 Release 正文（自动提取实际编入的插件）
+        run: |
+          cd openwrt
+          chmod +x "$GITHUB_WORKSPACE/gen-release-notes.sh"
+
+          # push 触发时，列出本次改了哪些文件
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANGE_FILES=$(jq -r '[(.head_commit.modified[]? | "- 修改 " + .),
+                                   (.head_commit.added[]?    | "- 新增 " + .),
+                                   (.head_commit.removed[]?  | "- 删除 " + .)] | join("\n")' \
+                           "$GITHUB_EVENT_PATH" 2>/dev/null || echo "")
+          else
+            CHANGE_FILES=""
+          fi
+
+          export CHANGE_FILES
+          export HEAD_SHORT="${{ needs.check.outputs.head_short }}"
+          export HEAD_DATE="${{ needs.check.outputs.head_date }}"
+          export HEAD_MSG="${{ needs.check.outputs.head_msg }}"
+          export TRIGGER_REASON="${{ needs.check.outputs.reason }}"
+
+          "$GITHUB_WORKSPACE/gen-release-notes.sh" "$GITHUB_WORKSPACE/release-notes.md"
+
+          echo "--- 正文预览 ---"
+          head -60 "$GITHUB_WORKSPACE/release-notes.md"
+
+      - name: 发布到 Release（永久保留）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: XR30-eMMC-${{ env.FILE_DATE }}-r${{ github.run_number }}
+          name: XR30 eMMC · ImmortalWrt 24.10 · kernel ${{ env.KERNEL }} · ${{ env.FILE_DATE }}
+          body_path: ${{ github.workspace }}/release-notes.md
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: artifact/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 失败时开启 SSH 调试
+        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.enable_ssh }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 30
+
+  # ------------------------------------------------------------------
+  # 构建成功后，把"已构建到哪个提交"写回仓库
+  # 失败则不写，下个周期会自动重试同一提交
+  # ------------------------------------------------------------------
+  update-state:
+    needs: [check, build]
+    if: ${{ always() && needs.check.outputs.should_build == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 写入已构建提交记录
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const branch = context.payload.repository.default_branch;
+            const path = process.env.STATE_FILE;
+            const sha = '${{ needs.check.outputs.head_sha }}';
+            const msg = `${{ needs.check.outputs.head_msg }}`;
+
+            const content = Buffer.from(`${sha}\n`).toString('base64');
+
+            let fileSha;
+            try {
+              const { data } = await github.rest.repos.getContent({ owner, repo, path, ref: branch });
+              fileSha = data.sha;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner, repo, path, branch,
+              message: `chore: record built upstream commit ${sha.slice(0, 7)}\n\n${msg}`,
+              content,
+              ...(fileSha ? { sha: fileSha } : {}),
+            });
+
+            core.info(`已记录上游提交 ${sha} 到 ${path}`);
