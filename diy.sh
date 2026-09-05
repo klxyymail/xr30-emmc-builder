@@ -21,12 +21,12 @@ echo "===== diy.sh 开始执行 ====="
 #   原厂 2.4G 23dBm / 5G 22dBm → 替换后 25dBm / 24dBm
 #   ⚠ eMMC 设备读取 eeprom 的方式与 NAND 不同，操作前先备份原厂分区
 # --------------------------------------------------------------
-# EEPROM_DIR="feeds/mtk/mtk_wifi/files/lib/firmware"
-# if [ -d "$EEPROM_DIR" ]; then
-#   cp "$GITHUB_WORKSPACE/eeprom/mt7981_eeprom.bin" \
-#      "$EEPROM_DIR/mt7981_eeprom_mt7976_dbdc.bin"
-#   echo "已替换 eeprom"
-# fi
+ EEPROM_DIR="feeds/mtk/mtk_wifi/files/lib/firmware"
+ if [ -d "$EEPROM_DIR" ]; then
+   cp "$GITHUB_WORKSPACE/eeprom/mt7981_eeprom.bin" \
+      "$EEPROM_DIR/mt7981_eeprom_mt7976_dbdc.bin"
+   echo "已替换 eeprom"
+ fi
 
 
 # --------------------------------------------------------------
@@ -34,8 +34,8 @@ echo "===== diy.sh 开始执行 ====="
 #   XR30-eMMC 可跑 52MHz（RAX3000M-eMMC 为 26MHz），速率翻倍
 #   ⚠ 部分机器体质不佳，52MHz 可能出现 I/O 报错甚至无法启动
 # --------------------------------------------------------------
-# sed -i 's/max-frequency = <26000000>/max-frequency = <52000000>/' \
-#     target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc-mtk.dts
+ sed -i 's/max-frequency = <26000000>/max-frequency = <52000000>/' \
+     target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc-mtk.dts
 
 
 # --------------------------------------------------------------
@@ -55,8 +55,8 @@ echo "===== diy.sh 开始执行 ====="
 #             XR30 是白色灯接 GPIO 34（低电平点亮）
 #   若你发现 LED 不亮或颜色不对，在这里按实际硬件调整 DTS
 # --------------------------------------------------------------
-# DTS="target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc-mtk.dts"
-# [ -f "$DTS" ] && sed -i 's/gpio = <[0-9]* GPIO_ACTIVE_HIGH>/gpio = <34 GPIO_ACTIVE_LOW>/' "$DTS"
+ DTS="target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-emmc-mtk.dts"
+ [ -f "$DTS" ] && sed -i 's/gpio = <[0-9]* GPIO_ACTIVE_HIGH>/gpio = <34 GPIO_ACTIVE_LOW>/' "$DTS"
 
 
 echo "===== diy.sh 执行完毕（当前未启用任何定制项）====="
