@@ -1,6 +1,8 @@
-on:name: Build ImmortalWrt 24.10 (k6.6) for CMCC XR30 eMMC
+name: Build ImmortalWrt 24.10 (k6.6) for CMCC XR30 eMMC
 
 # ============================================================================
+#  通用构建引擎 —— 本文件【永远不需要修改】
+#
 #  所有可变内容都在 configs/<机型名>.config 里：
 #    加插件        → 配置文件里加 CONFIG_PACKAGE_xxx=y
 #    加第三方仓库  → 配置文件的 ## [feeds] 段加一行
@@ -16,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       config:
-        description: cmcc_rax3000m-emmc-mtk.config
+        description: '机型配置文件名（留空 = 用 configs/ 下第一个）'
         required: false
         default: ''
         type: string
@@ -881,6 +883,3 @@ jobs:
               ...(fileSha ? { sha: fileSha } : {}),
             });
             core.info(`已记录 ${device} 的上游提交 ${sha.slice(0, 7)}`);
-
-
-            core.info(`已记录上游提交 ${sha} 到 ${path}`);
