@@ -151,6 +151,14 @@ if [ -z "$KERNEL_VER" ]; then
 fi
 [ -z "$KERNEL_VER" ] && KERNEL_VER="未知"
 
+# 构建器版本号（由 workflow 从 VERSION 文件读取后传入）
+VERSION_TAG="${VERSION_TAG:-}"
+[ -z "$VERSION_TAG" ] && VERSION_TAG="未知"
+
+# 编译/组装耗时（由 workflow 计时后传入）
+BUILD_DURATION="${BUILD_DURATION:-}"
+[ -z "$BUILD_DURATION" ] && BUILD_DURATION="未知"
+
 SYSUP=""
 for f in bin/targets/*/*/*"${DEVICE_NAME}"*sysupgrade*.bin; do
     [ -f "$f" ] && SYSUP="$f" && break
@@ -187,6 +195,7 @@ cat >> "$OUT" <<EOF
 
 | 项目 | 值 |
 | --- | --- |
+| 构建器版本 | \`${VERSION_TAG}\` |
 | 源码 | [\`${REPO_URL}\`](${REPO_URL}) |
 | 分支 | \`${REPO_BRANCH}\` |
 | 上游提交 | \`${HEAD_SHORT}\` |
@@ -197,6 +206,8 @@ cat >> "$OUT" <<EOF
 | Linux 内核 | ${KERNEL_VER} |
 | 构建时间 | ${FILE_DATE}（UTC+8） |
 | 触发方式 | ${TRIGGER_REASON} |
+| 编译耗时 | ${BUILD_DURATION} |
+| 固件大小 | ${FW_SIZE} |
 | 收录包总数 | ${TOTAL_PKGS} |
 
 ## 刷入的文件
@@ -231,7 +242,8 @@ SECTION_COUNT=0
 # iStore 与 ddns-go 也会在下方单独成章，一并排除
 emit_prefix_section "LuCI 应用" "luci-app-" \
     "luci-app-mtwifi-cfg luci-app-turboacc-mtk luci-app-eqos-mtk \
-     luci-app-store luci-app-ddns-go" && SECTION_COUNT=$((SECTION_COUNT+1))
+     luci-app-store luci-app-ddns-go luci-app-lucky \
+     luci-app-oaf luci-app-watchcat" && SECTION_COUNT=$((SECTION_COUNT+1))
 emit_prefix_section "LuCI 主题" "luci-theme-" && SECTION_COUNT=$((SECTION_COUNT+1))
 
 emit_list_section "代理核心" \
@@ -249,6 +261,19 @@ emit_list_section "分流 / DNS / 规则数据" \
 emit_list_section "iStore 应用商店" \
     luci-app-store luci-lib-taskd luci-lib-xterm taskd \
     mount-utils script-utils 2>/dev/null && SECTION_COUNT=$((SECTION_COUNT+1))
+
+# Lucky（公网神器）：主程序 + LuCI 界面
+emit_list_section "Lucky 公网神器" \
+    lucky luci-app-lucky luci-i18n-lucky-zh-cn 2>/dev/null && SECTION_COUNT=$((SECTION_COUNT+1))
+
+# OpenAppFilter（应用过滤 / 家长控制）：
+#   注明录名与包名不一致 —— open-app-filter/ 产出 appfilter，oaf/ 产出 kmod-oaf
+emit_list_section "OpenAppFilter 应用过滤" \
+    appfilter kmod-oaf luci-app-oaf luci-i18n-oaf-zh-cn 2>/dev/null && SECTION_COUNT=$((SECTION_COUNT+1))
+
+# Watchcat（网络看门狗）
+emit_list_section "Watchcat 网络看门狗" \
+    watchcat luci-app-watchcat luci-i18n-watchcat-zh-cn 2>/dev/null && SECTION_COUNT=$((SECTION_COUNT+1))
 
 emit_list_section "代理插件与 Obfs" \
     simple-obfs v2ray-plugin xray-plugin kcptun-client redsocks2 2>/dev/null && SECTION_COUNT=$((SECTION_COUNT+1))
@@ -280,9 +305,15 @@ cat >> "$OUT" <<'EOF'
 1. **硬件加速与代理插件冲突**：MT7981 的 HNAT/PPE 会让流量绕过 CPU 转发，
    导致 ssr-plus / passwall 的透明代理失效或异常。使用代理插件时，
    请在 `luci-app-turboacc-mtk` 中关闭「硬件流量分载」，仅保留 BBR + 全锥形 NAT。
-2. **ssr-plus 与 passwall 建议二选一**：编译上可以共存，
+2. **硬件加速同样会让 OAF 失效**：OpenAppFilter 依赖 netfilter 钩子抓包识别应用，
+   流量一旦被 HNAT/PPE 卸载到硬件转发，就完全不经过 CPU，
+   OAF 将识别不到任何应用。需要用 OAF 时也必须关闭「硬件流量分载」。
+   ⚠ 这意味着**硬件加速与（代理 / OAF）只能二选一**，不可兼得。
+3. **OAF 含内核模块 `kmod-oaf`**：它与内核版本强绑定。
+   上游若更新内核版本，需重新完整编译（本流程会自动判定并切换）。
+4. **ssr-plus 与 passwall 建议二选一**：编译上可以共存，
    但同时运行会争抢 chinadns-ng 等本地端口。
-3. **先确认是 eMMC 版**：机身标签 `CH **EC** CMIIT ID` 才是 eMMC（算力版）。
+5. **先确认是 eMMC 版**：机身标签 `CH **EC** CMIIT ID` 才是 eMMC（算力版）。
    只有 `CH CMIIT ID` 的是 NAND 版，刷此固件会变砖。
 
 完整配置见 `full.config`，校验值见 `sha256sums`。
