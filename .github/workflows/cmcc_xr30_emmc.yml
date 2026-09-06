@@ -73,6 +73,45 @@ env:
   THEME:    argon
 
   # ==========================================================================
+  #  PassWall 出厂预置（PT / BT 下载安全）
+  #
+  #  目标：同一台电脑既能科学上网，又能跑 PT/BT，且下载流量不走代理。
+  #
+  #  原理：网页流量走 80/443，BT 的 P2P 走高端口（6881-6889、51413 等），
+  #        两者端口区间天然分离，用端口过滤即可分开处理。
+  #
+  #  PW_TCP_REDIR_PORTS：TCP 只代理这些端口
+  #    下列默认值即 PassWall 的「常用端口」，已含 80/443（网页）。
+  #    BT 常用端口不在其中 → P2P 下载自动直连。
+  #    80,443 = 仅网页（更保守）；1:65535 = 全代理（不要用）。
+  #
+  #  PW_UDP_PROXY：UDP 是否代理
+  #    0（默认，PT 必须）→ udp_proxy_mode=disable，所有 UDP 直连。
+  #      ⚠ PassWall 的 udp_redir_ports 默认是 1:65535（全代理），
+  #        而 PT 的 DHT / UDP tracker 全是 UDP —— 不关掉就等于全走代理，
+  #        前面的端口过滤全部白做。
+  #    1 → 开启 UDP 代理（需要 UDP 转发或游戏加速时再开）。
+  #
+  #  PW_DIRECT_HOSTS：直连域名（空格分隔）
+  #    ⚠ 这项【必须自己填你实际使用的 PT 站域名】。
+  #      tracker 通信走 80/443，会被上面的「常用端口」规则代理掉，
+  #      导致 PT 站记录到 VPS IP，判定「盒子下载」，失去限免与上传优惠。
+  #      加入直连列表后 tracker 走家宽，站点记录真实 IP。
+  #      例：m-team.cc hdsky.me ourbits.club
+  #      留空则只写入注释，不添加任何域名。
+  #
+  #  ⚠ 本预置【不会】自动开启 PassWall 主开关（enabled 保持 0）：
+  #     还没导入节点就启用会启动失败、刷错误日志。
+  #     请刷机后导入节点，再手动打开主开关。
+  #
+  #  ⚠ 仅对【全新刷机 / 重置配置】生效。sysupgrade 保留配置时不会执行
+  #     （uci-defaults 只在首次启动运行），不会覆盖你已有的设置。
+  # ==========================================================================
+  PW_TCP_REDIR_PORTS: '22,25,53,80,143,443,465,587,853,873,993,995,5222,8080,8443,9418'
+  PW_UDP_PROXY: 0
+  PW_DIRECT_HOSTS: ''
+
+  # ==========================================================================
   #  硬件加速（HNAT / PPE）出厂默认开关
   #
   #  源码默认是【开启】的：defconfig 编译 kmod-mediatek_hnat，
@@ -80,14 +119,18 @@ env:
   #    fastpath=mediatek_hnat / fastpath_mh_eth_hnat=1 / v6=1
   #
   #  ⚠ 但硬件加速与下列功能【互斥】，开启时它们全部失效：
-  #      · ssr-plus / passwall 透明代理（流量不过 CPU，无法重定向）
+  #      · PassWall 透明代理（流量不过 CPU，无法重定向）
   #      · OAF 应用过滤（不经过 netfilter 钩子，识别不到应用）
   #
-  #    0 = 关闭硬件加速（当前默认，因为本配置装了上述插件）
-  #    1 = 开启硬件加速（跑满 NAT 性能，但代理与 OAF 失效）
+  #    ⚠ v1.5.0 曾彻底移除硬件加速，v1.6.0 已回退为「保留但默认关闭」。
+  #      现在 turboacc 界面与内核模块都在（沿用 defconfig 的 =y），
+  #      本开关决定【出厂默认值】，刷机后可在 LuCI 页面随时手动切换。
   #
-  #  刷机后仍可在 LuCI 的「Turbo ACC 网络加速」页面随时手动切换，
-  #  这里只决定【出厂默认值】。
+  #    0 = 关闭硬件加速（默认，代理 PassWall 与 OAF 需要）
+  #    1 = 开启硬件加速（跑满 NAT 性能，但代理与 OAF 会失效）
+  #
+  #  实现方式是改写 turboacc 的 uci-defaults 脚本本身
+  #  （只改 /etc/config/turboacc 无效，uci-defaults 首次启动会覆盖它）。
   # ==========================================================================
   HW_OFFLOAD: 0
 
@@ -364,14 +407,18 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           echo "=== 关键包校验 ==="
+          # ⚠ 必须加 -L：feeds install 创建的是 symlink
+          #   package/feeds/luci/luci-app-passwall -> ../../../feeds/luci/applications/luci-app-passwall
+          #   不加 -L 时 find 默认不跟随 symlink，且 symlink 的 type 是 l 而非 d，
+          #   会导致所有 feeds 包都被误报为 [缺失]（实测确认，与历史日志一致）
           for p in luci-app-passwall luci-theme-argon luci-app-argon-config \
-                   luci-app-ssr-plus shadowsocksr-libev \
                    luci-app-store luci-lib-taskd luci-lib-xterm taskd \
                    luci-app-ddns-go ddns-go \
                    luci-app-lucky lucky \
                    luci-app-oaf appfilter \
-                   luci-app-watchcat watchcat; do
-            if find package/feeds -maxdepth 3 -name "$p" -type d 2>/dev/null | grep -q .; then
+                   luci-app-watchcat watchcat \
+                   luci-app-diskman; do
+            if find -L package/feeds -maxdepth 3 -name "$p" -type d 2>/dev/null | grep -q .; then
               echo "  [OK]   $p"
             else
               echo "  [缺失] $p"
@@ -394,16 +441,37 @@ jobs:
           CONFIG_TARGET_${{ env.TARGET }}_${{ env.SUBTARGET }}=y
           CONFIG_TARGET_${{ env.TARGET }}_${{ env.SUBTARGET }}_DEVICE_${{ env.DEVICE }}=y
           EOF
-          # 追加用户插件配置（去掉空行与注释，只留 CONFIG_）
-          grep -E '^CONFIG_' "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" >> .config
+          # 追加用户插件配置
+          # ⚠ 必须同时匹配两类行，不能只取 ^CONFIG_：
+          #   ^CONFIG_                        → CONFIG_PACKAGE_xxx=y     （开启）
+          #   ^# CONFIG_xxx is not set        → 取消 defconfig 里的默认开启
+          # 只取 ^CONFIG_ 会让所有 "is not set" 行被丢弃，
+          # 导致无法取消 defconfig 中已 =y 的包（实测验证过）。
+          # 不匹配 "# CONFIG_xxx=y" 这种被注释掉的可选项，避免误生效。
+          grep -E '^CONFIG_|^# CONFIG_[A-Za-z0-9_-]+ is not set[[:space:]]*$' \
+            "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" >> .config
           make defconfig
           echo "=== 机型 ==="
           grep -E "^CONFIG_TARGET_${{ env.TARGET }}|^CONFIG_TARGET_MULTI_PROFILE" .config
           echo "=== 关键插件 ==="
-          for k in luci-app-passwall luci-app-ssr-plus luci-app-store \
-                   luci-app-ddns-go luci-theme-argon; do
+          for k in luci-app-passwall luci-app-store luci-app-diskman \
+                   luci-app-ddns-go luci-theme-argon luci-app-oaf luci-app-lucky; do
             grep -m1 "^CONFIG_PACKAGE_${k}=" .config || echo "  $k 未启用"
           done
+
+          echo "=== 最终进入固件的 LuCI 应用（决定菜单显示）==="
+          grep -oE '^CONFIG_PACKAGE_luci-app-[A-Za-z0-9._+-]+=y$' .config \
+            | sed 's/^CONFIG_PACKAGE_//; s/=y$//' | sort | sed 's/^/  /'
+          echo "  --- 内核模块（含 OAF 依赖）---"
+          grep -E '^CONFIG_PACKAGE_kmod-oaf=' .config || echo "  kmod-oaf 未启用"
+          echo "  --- DNS（代理插件依赖 dnsmasq-full）---"
+          grep -E '^CONFIG_PACKAGE_dnsmasq' .config | sed 's/^/  /'
+          echo "  --- 硬件加速（保留，出厂默认关闭；缺失则需检查 defconfig）---"
+          grep -E '^CONFIG_PACKAGE_(luci-app-turboacc-mtk|kmod-mediatek_hnat|kmod-warp)=' .config \
+            | sed 's/^/  /' || echo "  (未在 .config 中找到，可能已被取消)"
+          echo "  --- eMMC 自动挂载依赖 ---"
+          grep -E '^CONFIG_PACKAGE_(kmod-fs-ext4|block-mount|blkid)=' .config \
+            | sed 's/^/  /' || echo "  (缺失！自动挂载将不生效)"
 
       - name: 应用定制项
         if: ${{ env.ASSEMBLE != '1' }}
@@ -429,6 +497,96 @@ jobs:
           echo "=== 定制结果 ==="
           grep -E "lan) ipad|hostname=|timezone=|zonename=" "$CFG_GEN" 2>/dev/null | head -8
 
+          # ------------------------------------------------------------------
+          # 生成 PassWall 出厂预置脚本（PT/BT 安全）
+          #
+          #   ⚠ 必须在注入 files/ 【之前】生成，否则复制时会漏掉它。
+          #   ⚠ 环境变量在这里（构建期）展开，写死进脚本；
+          #      uci-defaults 是在路由器上跑的，那时拿不到 GitHub 的 env。
+          #
+          #   文件名 zzz- 前缀：确保在包自带的 uci-defaults（luci-passwall）之后执行。
+          # ------------------------------------------------------------------
+          PW_UD="$GITHUB_WORKSPACE/files/etc/uci-defaults"
+          mkdir -p "$PW_UD"
+
+          if [ "${{ env.PW_UDP_PROXY }}" = "1" ]; then
+            PW_UDP_MODE=proxy
+          else
+            PW_UDP_MODE=disable
+          fi
+
+          {
+            echo '#!/bin/sh'
+            echo '# PassWall 出厂预置（由固件构建时生成，PT/BT 下载安全）'
+            echo '# 仅首次启动执行；保留配置升级时不会运行，不会覆盖已有设置。'
+            echo ''
+            echo '# 未安装 passwall 则跳过'
+            echo '[ -d /usr/share/passwall ] || exit 0'
+            echo ''
+            echo '# 确保 global section 存在（包不自带 /etc/config/passwall，'
+            echo '#  conffiles 只是声明；首次启动时可能还没有这个 section）'
+            echo 'uci -q get passwall.@global[0] >/dev/null 2>&1 || \'
+            echo '  uci -q add passwall global >/dev/null 2>&1'
+            echo 'uci -q get passwall.@global[0] >/dev/null 2>&1 || exit 0'
+            echo ''
+            echo "# TCP 仅代理常用端口（含 80/443 网页）"
+            echo "uci -q set passwall.@global[0].tcp_redir_ports='${{ env.PW_TCP_REDIR_PORTS }}'"
+            echo ''
+            echo "# UDP 代理开关：${PW_UDP_MODE}"
+            echo "uci -q set passwall.@global[0].udp_proxy_mode='${PW_UDP_MODE}'"
+            echo ''
+            echo '# 注意：不设置 enabled，保持关闭。'
+            echo '# 未导入节点就启用会启动失败并刷错误日志，需用户手动开。'
+            echo 'uci -q commit passwall'
+            echo ''
+            echo '# ---- 直连域名列表 ----'
+            echo '# PassWall 的直连列表是【文件】而非 UCI：'
+            echo '#   /usr/share/passwall/rules/direct_host'
+            echo '# 每行一个域名，支持 # 注释与 geosite: 前缀。'
+            echo 'mkdir -p /usr/share/passwall/rules'
+            echo 'DIRECT_FILE=/usr/share/passwall/rules/direct_host'
+            echo '[ -f "$DIRECT_FILE" ] || : > "$DIRECT_FILE"'
+            echo ''
+            echo '# 幂等：已写入过则跳过，避免重复追加'
+            echo 'if ! grep -q "PT-DIRECT-PRESET" "$DIRECT_FILE" 2>/dev/null; then'
+            echo '  {'
+            echo '    echo ""'
+            echo '    echo "# ===== PT-DIRECT-PRESET: PT/BT 站点直连（固件预置）====="'
+            echo '    echo "# 目的：tracker 通信走 80/443 会被代理，导致站点记录 VPS IP"'
+            echo '    echo "#       判定「盒子下载」，失去限免与上传优惠。"'
+            echo '    echo "# 可在此处继续添加，或在 LuCI 规则列表里修改。"'
+            for d in ${{ env.PW_DIRECT_HOSTS }}; do
+              echo "    echo '${d}'"
+            done
+            echo '  } >> "$DIRECT_FILE"'
+            echo '  logger -t passwall-preset "已写入直连域名列表"'
+            echo 'fi'
+            echo ''
+            echo 'logger -t passwall-preset "出厂预置完成: TCP仅常用端口, UDP='${PW_UDP_MODE}'"'
+            echo 'exit 0'
+          } > "$PW_UD/zzz-passwall-preset"
+          chmod +x "$PW_UD/zzz-passwall-preset"
+
+          echo "=== PassWall 预置脚本已生成 ==="
+          echo "  TCP 代理端口: ${{ env.PW_TCP_REDIR_PORTS }}"
+          echo "  UDP 代理:     ${PW_UDP_MODE}"
+          echo "  直连域名:     ${{ env.PW_DIRECT_HOSTS }}（空则仅写注释）"
+
+          # ------------------------------------------------------------------
+          # 注入 files/ 目录内容到固件（OpenWrt 标准机制）
+          #   源码树顶层的 files/ 会被原样打包进 rootfs。
+          #   包含：etc/uci-defaults/zzz-emmc-mount（eMMC 剩余空间自动挂载）
+          #        etc/uci-defaults/zzz-passwall-preset（上面刚生成的）
+          # ------------------------------------------------------------------
+          if [ -d "$GITHUB_WORKSPACE/files" ]; then
+            mkdir -p files
+            cp -r "$GITHUB_WORKSPACE/files"/. files/
+            echo "=== 已注入 files/ 内容 ==="
+            find files -type f | sed 's/^/  /'
+          else
+            echo "（无 files/ 目录，跳过注入）"
+          fi
+
       # ------------------------------------------------------------------
       # 硬件加速（HNAT / PPE）出厂默认值
       #
@@ -451,7 +609,7 @@ jobs:
           TA_DEF="package/mtk/applications/luci-app-turboacc-mtk/root/etc/uci-defaults/turboacc"
 
           if [ ! -f "$TA_DEF" ]; then
-            echo "未找到 $TA_DEF，跳过（硬件加速保持源码默认）"
+            echo "未找到 $TA_DEF —— 硬件加速（turboacc）已在配置中移除，无需设置"
             exit 0
           fi
 
@@ -464,7 +622,7 @@ jobs:
             sed -i 's|"turboacc.config.fastpath"="mediatek_hnat"|"turboacc.config.fastpath"="none"|' "$TA_DEF"
             sed -i 's|"turboacc.config.fastpath_mh_eth_hnat"="[01]"|"turboacc.config.fastpath_mh_eth_hnat"="0"|' "$TA_DEF"
             sed -i 's|"turboacc.config.fastpath_mh_eth_hnat_v6"="[01]"|"turboacc.config.fastpath_mh_eth_hnat_v6"="0"|' "$TA_DEF"
-            echo "硬件加速: 已关闭（代理 ssr-plus/passwall 与 OAF 需要）"
+            echo "硬件加速: 已关闭（代理 PassWall 与 OAF 需要）"
           fi
 
           echo "--- turboacc uci-defaults 实际值 ---"
@@ -517,7 +675,7 @@ jobs:
       - name: 准备定制文件
         if: ${{ env.ASSEMBLE == '1' }}
         run: |
-          D="$GITHUB_WORKSPACE/ibfiles/etc/uci-defaults"
+          D="$GITHUB_WORKSPACE/files/etc/uci-defaults"
           mkdir -p "$D"
 
           # ⚠ 文件名必须是 zzz-custom 而非 99-custom：
@@ -568,7 +726,7 @@ jobs:
           make image \
             PROFILE="${{ env.DEVICE }}" \
             PACKAGES="$AVAIL_PKGS" \
-            FILES="$GITHUB_WORKSPACE/ibfiles" \
+            FILES="$GITHUB_WORKSPACE/files" \
             BIN_DIR="$GITHUB_WORKSPACE/openwrt/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}" \
             EXTRA_IMAGE_NAME="assembled"
           ls -lh "$GITHUB_WORKSPACE/openwrt/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}"
