@@ -1,0 +1,147 @@
+#!/bin/sh
+# ============================================================================
+#  eMMC 剩余空间自动挂载
+#
+#  背景：CMCC XR30 eMMC 算力版为 64GB，固件仅占用前部一小部分，
+#        剩余约 54-57GB 默认【未挂载】。社区反馈该空间在 GPT 表中
+#        已存在为一个分区（如 /dev/mmcblk0p12），只是没有配置挂载点。
+#
+#  本脚本在首次启动时执行：
+#    1. 在 /dev/mmcblk0p* 中寻找【最大的、未挂载的、且大于 2GB】的分区
+#    2. 已有文件系统 → 直接挂载
+#       无文件系统   → 格式化为 ext4 后挂载
+#    3. 挂载到 /mnt/emmc，并写入 /etc/config/fstab 实现开机自动挂载
+#    4. 幂等：已挂载 / 已写入 fstab 时不会重复格式化
+#
+#  ⚠ 安全保护：
+#    · 跳过 rootfs / overlay 所在分区
+#    · 跳过已挂载的分区
+#    · 只处理大于 2GB 的分区（避免误操作 config / factory 等小分区）
+#    · 只在 blkid 完全识别不到文件系统时才格式化
+#
+#  ⚠ 若你的剩余分区上仍有需要的数据，请在刷机【前】备份，
+#    或刷机后删除 /etc/uci-defaults/zzz-emmc-mount 再重启。
+#
+#  文件名以 zzz- 开头：OpenWrt 的 uci-defaults 按文件名排序执行，
+#  确保排在各包自带的 uci-defaults（如 turboacc）之后。
+# ============================================================================
+
+DEV=/dev/mmcblk0
+MNT=/mnt/emmc
+MIN_SIZE=4194304          # 2GB（单位：512 字节扇区）
+
+# 非 eMMC 设备直接退出
+[ -b "$DEV" ] || exit 0
+
+# 等待分区节点就绪（最多约 5 秒）
+i=0
+while [ $i -lt 50 ]; do
+    ls /dev/mmcblk0p* >/dev/null 2>&1 && break
+    i=$((i + 1))
+    sleep 0.1
+done
+
+# ---------- 1. 找出 rootfs / overlay 所在分区，避免误操作 ----------
+root_part=""
+# /proc/mounts 中 root 可能是 overlay:/overlay 或 /dev/mmcblk0pX
+if grep -q ' /overlay ' /proc/mounts 2>/dev/null; then
+    # overlayfs：找下层设备
+    root_part=$(grep ' /rom ' /proc/mounts 2>/dev/null | awk '{print $1}')
+    [ -n "$root_part" ] || root_part=$(grep ' / ' /proc/mounts | awk '{print $1}')
+else
+    root_part=$(awk '$2=="/"{print $1}' /proc/mounts 2>/dev/null)
+fi
+# 统一为 /dev/mmcblk0pN 形式（若是 /dev/root 之类则忽略）
+case "$root_part" in
+    /dev/mmcblk0p*) : ;;
+    *) root_part="" ;;
+esac
+
+# ---------- 2. 扫描候选分区 ----------
+best_part=""
+best_size=0
+
+for part in /dev/mmcblk0p*; do
+    [ -b "$part" ] || continue
+
+    name=$(basename "$part")
+    # 跳过整盘（mmcblk0p0 不存在，但保险）
+    case "$name" in mmcblk0p0) continue ;; esac
+
+    # 跳过 root 分区
+    [ "$part" = "$root_part" ] && continue
+
+    # 跳过已挂载的（含作为 overlay 使用的）
+    if grep -q "^${part} " /proc/mounts 2>/dev/null; then
+        continue
+    fi
+
+    # 读取分区大小（512 字节扇区）
+    size=$(cat "/sys/class/block/${name}/size" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+
+    # 只考虑大于 2GB 的分区
+    [ "$size" -gt "$MIN_SIZE" ] || continue
+
+    if [ "$size" -gt "$best_size" ]; then
+        best_size=$size
+        best_part=$part
+    fi
+done
+
+if [ -z "$best_part" ]; then
+    logger -t emmc-mount "未找到符合条件的 eMMC 剩余分区，跳过"
+    exit 0
+fi
+
+# ---------- 3. 确认 / 创建文件系统 ----------
+fs=$(blkid -s TYPE -o value "$best_part" 2>/dev/null)
+
+if [ -z "$fs" ]; then
+    logger -t emmc-mount "$best_part 无文件系统，格式化为 ext4"
+    if command -v mkfs.ext4 >/dev/null 2>&1; then
+        mkfs.ext4 -F -L emmc_data "$best_part" >/dev/null 2>&1
+        fs=$(blkid -s TYPE -o value "$best_part" 2>/dev/null)
+    else
+        logger -t emmc-mount "缺少 mkfs.ext4，无法格式化，跳过"
+        exit 0
+    fi
+fi
+
+if [ -z "$fs" ]; then
+    logger -t emmc-mount "无法确定 $best_part 的文件系统，跳过"
+    exit 0
+fi
+
+logger -t emmc-mount "挂载 $best_part ($fs, $((best_size / 2097152)) GB) 到 $MNT"
+
+# ---------- 4. 写入 fstab 并挂载 ----------
+mkdir -p "$MNT"
+
+uci -q batch <<EOF
+delete fstab.emmc_data
+set fstab.emmc_data=mount
+set fstab.emmc_data.device='$best_part'
+set fstab.emmc_data.target='$MNT'
+set fstab.emmc_data.fstype='$fs'
+set fstab.emmc_data.options='rw,noatime'
+set fstab.emmc_data.enabled='1'
+set fstab.emmc_data.enabled_fsck='0'
+commit fstab
+EOF
+
+# 立即挂载（block 可用则用 block，否则 fallback 到 mount）
+if command -v block >/dev/null 2>&1; then
+    block mount >/dev/null 2>&1
+fi
+if ! grep -q "^${best_part} ${MNT} " /proc/mounts 2>/dev/null; then
+    mount -t "$fs" -o rw,noatime "$best_part" "$MNT" >/dev/null 2>&1
+fi
+
+if grep -q " ${MNT} " /proc/mounts 2>/dev/null; then
+    logger -t emmc-mount "成功挂载到 $MNT"
+else
+    logger -t emmc-mount "挂载失败，请检查日志"
+fi
+
+exit 0
