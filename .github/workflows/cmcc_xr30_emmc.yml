@@ -57,12 +57,21 @@ env:
   #  第三方插件仓库（追加到 feeds.conf.default 末尾，官方源优先级更高）
   #  格式: 名字 空格 地址;分支
   # ==========================================================================
+  #
+  #  ⚠ OAF（下面 oaf 那一行）：v1.7.1 起【默认不再选择任何 OAF 包】。
+  #    上游存在 kconfig 递归依赖 bug：
+  #      symbol PACKAGE_kmod-oaf is selected by PACKAGE_kmod-oaf
+  #    导致 kmod-oaf 从头到尾没被编译，安装阶段依赖它的
+  #    appfilter / luci-app-oaf 全部失败 →
+  #    package/install Error 255 → 整个构建失败。
+  #    feed 行保留在此，方便日后上游修复后重新启用；
+  #    configs/ 里不选 OAF 包就不会参与编译，无副作用。
+  #    详见 configs/cmcc_xr30_emmc.config 第十节。
   FEEDS: |
     helloworld https://github.com/fw876/helloworld.git;dev
     istore     https://github.com/linkease/istore.git;main
     lucky      https://github.com/gdy666/luci-app-lucky.git;main
     oaf        https://github.com/destan19/OpenAppFilter.git;master
-
   # ==========================================================================
   #  固件定制（改这里 = 改 IP / 主机名 / 主题）
   # ==========================================================================
@@ -415,7 +424,6 @@ jobs:
                    luci-app-store luci-lib-taskd luci-lib-xterm taskd \
                    luci-app-ddns-go ddns-go \
                    luci-app-lucky lucky \
-                   luci-app-oaf appfilter \
                    luci-app-watchcat watchcat \
                    luci-app-diskman; do
             if find -L package/feeds -maxdepth 3 -name "$p" -type d 2>/dev/null | grep -q .; then
@@ -425,6 +433,45 @@ jobs:
             fi
           done
 
+
+            # ------------------------------------------------------------------
+            # 移除 luci-app-ssr-plus 的包定义（v1.7.2）
+            #
+            #   背景：v1.6.0 起已不再编译 ssr-plus，但它的 Makefile 仍随
+            #         helloworld feed 被 install 进来，config 项依然存在。
+            #
+            #   问题：该 Makefile 里有这段（helloworld@dev 实测）：
+            #           config PACKAGE_luci-app-ssr-plus_INCLUDE_Mihomo
+            #             bool "Include Mihomo (Clash Support)"
+            #             select PACKAGE_mihomo
+            #             select PACKAGE_v2ray-geoip
+            #             depends on aarch64||arm||i386||loongarch64||riscv64||x86_64
+            #             default y if aarch64||arm||i386||loongarch64||riscv64||x86_64
+            #
+            #         ⚠ depends on 只写了【架构】，没有 depends on ssr-plus 本身！
+            #         于是即便不选 ssr-plus，只要目标是 aarch64（MT7981 正是），
+            #         该开关就默认 =y，进而 select PACKAGE_mihomo。
+            #
+            #   后果：mihomo 是超重的 Go 项目（GO_PKG_TAGS:=with_gvisor，
+            #         gvisor 体量巨大），被无端拉进编译，极易失败：
+            #           ERROR: package/feeds/helloworld/mihomo failed to build.
+            #         同时白白拖长编译时间。
+            #
+            #   同样问题：INCLUDE_Http_Proxy（select PACKAGE_3proxy，aarch64 默认 y）。
+            #
+            #   修复：直接删除该包目录，让这些 config 项根本不进入 kconfig。
+            #         比在 .config 写 "is not set" 更彻底——kconfig 中
+            #         select 优先级高于 is not set，写 is not set 未必生效。
+            #
+            #   注意：helloworld 的 xray-core / chinadns-ng / geoview 仍保留。
+            # ------------------------------------------------------------------
+            for d in feeds/helloworld/luci-app-ssr-plus \
+                     package/feeds/helloworld/luci-app-ssr-plus; do
+              if [ -e "$d" ] || [ -L "$d" ]; then
+                rm -rf "$d"
+                echo "  [已移除] $d（避免 mihomo 被无端拉入编译）"
+              fi
+            done
       - name: 载入机型配置
         if: ${{ env.ASSEMBLE != '1' }}
         run: |
@@ -455,15 +502,16 @@ jobs:
           grep -E "^CONFIG_TARGET_${{ env.TARGET }}|^CONFIG_TARGET_MULTI_PROFILE" .config
           echo "=== 关键插件 ==="
           for k in luci-app-passwall luci-app-store luci-app-diskman \
-                   luci-app-ddns-go luci-theme-argon luci-app-oaf luci-app-lucky; do
+                   luci-app-ddns-go luci-theme-argon luci-app-lucky; do
             grep -m1 "^CONFIG_PACKAGE_${k}=" .config || echo "  $k 未启用"
           done
 
           echo "=== 最终进入固件的 LuCI 应用（决定菜单显示）==="
           grep -oE '^CONFIG_PACKAGE_luci-app-[A-Za-z0-9._+-]+=y$' .config \
             | sed 's/^CONFIG_PACKAGE_//; s/=y$//' | sort | sed 's/^/  /'
-          echo "  --- 内核模块（含 OAF 依赖）---"
-          grep -E '^CONFIG_PACKAGE_kmod-oaf=' .config || echo "  kmod-oaf 未启用"
+          echo "  --- OAF（v1.7.1 起已移除，应无输出）---"
+          grep -E '^CONFIG_PACKAGE_(luci-app-oaf|appfilter|kmod-oaf)=' .config \
+            | sed 's/^/  ! 仍启用: /' || true
           echo "  --- DNS（代理插件依赖 dnsmasq-full）---"
           grep -E '^CONFIG_PACKAGE_dnsmasq' .config | sed 's/^/  /'
           echo "  --- 硬件加速（保留，出厂默认关闭；缺失则需检查 defconfig）---"
