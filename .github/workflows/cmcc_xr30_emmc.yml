@@ -382,7 +382,7 @@ jobs:
             openwrt/build_dir/host
             openwrt/build_dir/hostpkg
             openwrt/tmp/go-build
-            openwrt/tmp/go-mod-cache
+            openwrt/dl/go-mod-cache
           key: go-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
           restore-keys: |
             go-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-
@@ -695,6 +695,43 @@ jobs:
           make download -j$(nproc) || make download -j1 V=s
           find dl -size -1024c -exec rm -f {} \;
 
+      # ------------------------------------------------------------------
+      # 预创建所有缓存目录（v1.7.3）
+      #
+      #   背景：之前日志反复出现
+      #     [warning]Path Validation Error: Path(s) specified in the action
+      #              for caching do(es) not exist, hence no cache is being saved.
+      #     ##[warning]Cache save failed.
+      #
+      #   两个成因：
+      #     ① Go module 缓存路径写错（见下方说明）
+      #     ② 编译在很早期就失败时，缓存目录根本没被创建，
+      #        保存步骤找不到路径 → 报 Cache save failed，
+      #        连已经编译好的部分也一起丢了。
+      #
+      #   Go module 缓存路径修正依据（immortalwrt/packages@openwrt-24.10）：
+      #     lang/golang/golang-values.mk:
+      #       GO_BUILD_CACHE_DIR:=$(TMP_DIR)/go-build        → tmp/go-build
+      #       GO_MOD_CACHE_DIR:=$(DL_DIR)/go-mod-cache       → dl/go-mod-cache
+      #
+      #     ⚠ 之前写的是 tmp/go-mod-cache —— 实际根本不存在，
+      #       导致 Go 依赖每次都要重新下载（几百 MB），
+      #       既慢又容易因网络抖动失败。
+      #       这很可能就是 ddns-go 编译失败的直接原因。
+      #
+      #   现在先 mkdir -p 建好目录，即使编译失败也能存下已有成果。
+      # ------------------------------------------------------------------
+      - name: 确保缓存目录存在
+        if: ${{ env.ASSEMBLE != '1' }}
+        run: |
+          cd openwrt
+          mkdir -p dl dl/go-mod-cache tmp/go-build .ccache
+          echo "=== 缓存目录 ==="
+          for d in dl dl/go-mod-cache tmp/go-build .ccache; do
+            printf "  %-20s %s\n" "$d" "$(du -sh $d 2>/dev/null | cut -f1)"
+          done
+
+
       - name: 编译固件
         id: compile
         if: ${{ env.ASSEMBLE != '1' }}
@@ -795,7 +832,7 @@ jobs:
             openwrt/build_dir/host
             openwrt/build_dir/hostpkg
             openwrt/tmp/go-build
-            openwrt/tmp/go-mod-cache
+            openwrt/dl/go-mod-cache
           key: go-${{ env.DEVICE }}-${{ env.REPO_BRANCH }}-${{ env.CFG_HASH }}
 
       - name: 保存 ccache
