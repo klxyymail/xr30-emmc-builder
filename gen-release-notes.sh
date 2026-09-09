@@ -210,6 +210,26 @@ cat >> "$OUT" <<EOF
 | 固件大小 | ${FW_SIZE} |
 | 收录包总数 | ${TOTAL_PKGS} |
 
+EOF
+
+# ---- OAF 若被自动跳过，在此明确标注，避免用户以为已包含 ----
+if [ "${OAF_SKIPPED:-0}" = "1" ]; then
+  cat >> "$OUT" <<'EOF'
+> ## ⚠ 本次未包含 OAF 应用过滤
+>
+> 编译前自检发现：勾选了 `luci-app-oaf`，但内核模块 `kmod-oaf`
+> **未能进入配置**（上游 kconfig 递归依赖导致被静默丢弃）。
+>
+> 若强行继续，会在最后的 opkg 安装阶段失败
+> （`cannot find dependency kmod-oaf` → `package/install Error 255`），
+> 白白浪费约 3 小时。因此本次自动跳过 OAF，保证固件正常产出。
+>
+> 其余插件不受影响。
+
+EOF
+fi
+
+cat >> "$OUT" <<EOF
 ## 刷入的文件
 
 \`\`\`
