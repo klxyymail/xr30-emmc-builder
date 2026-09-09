@@ -32,6 +32,8 @@ on:
 
 permissions:
   contents: write
+  # v1.7.5：用于清理旧缓存（gh cache delete 需要 actions: write）
+  actions: write
 
 concurrency:
   group: build-xr30-emmc
@@ -253,9 +255,15 @@ jobs:
           android: true
           dotnet: true
           haskell: true
-          large-packages: false
+          # v1.7.5：打开这两项
+          #   large-packages: 移除预装的大型包（chrome 等），多出数 GB 磁盘
+          #   swap-storage:   分配 swap。runner 只有 16GB 内存且默认无 swap，
+          #                   编译 xray-core / btrfs-progs 这类大项目时
+          #                   极易触发 OOM（表现为 signal killed / 无明确报错）。
+          #                   OpenWrt 完整构建峰值可达 10-20GB。
+          large-packages: true
           docker-images: true
-          swap-storage: false
+          swap-storage: true
 
       - name: 环境信息
         run: |
@@ -424,8 +432,8 @@ jobs:
                    luci-app-store luci-lib-taskd luci-lib-xterm taskd \
                    luci-app-ddns-go ddns-go \
                    luci-app-lucky lucky \
-                   luci-app-watchcat watchcat \
-                   luci-app-diskman; do
+                   luci-app-oaf appfilter \
+                   luci-app-watchcat watchcat; do
             if find -L package/feeds -maxdepth 3 -name "$p" -type d 2>/dev/null | grep -q .; then
               echo "  [OK]   $p"
             else
@@ -501,7 +509,7 @@ jobs:
           echo "=== 机型 ==="
           grep -E "^CONFIG_TARGET_${{ env.TARGET }}|^CONFIG_TARGET_MULTI_PROFILE" .config
           echo "=== 关键插件 ==="
-          for k in luci-app-passwall luci-app-store luci-app-diskman \
+          for k in luci-app-passwall luci-app-store luci-app-oaf \
                    luci-app-ddns-go luci-theme-argon luci-app-lucky; do
             grep -m1 "^CONFIG_PACKAGE_${k}=" .config || echo "  $k 未启用"
           done
@@ -509,9 +517,9 @@ jobs:
           echo "=== 最终进入固件的 LuCI 应用（决定菜单显示）==="
           grep -oE '^CONFIG_PACKAGE_luci-app-[A-Za-z0-9._+-]+=y$' .config \
             | sed 's/^CONFIG_PACKAGE_//; s/=y$//' | sort | sed 's/^/  /'
-          echo "  --- OAF（v1.7.1 起已移除，应无输出）---"
+          echo "  --- OAF（v1.7.6 重新启用；重点看 kmod-oaf）---"
           grep -E '^CONFIG_PACKAGE_(luci-app-oaf|appfilter|kmod-oaf)=' .config \
-            | sed 's/^/  ! 仍启用: /' || true
+            | sed 's/^/  /' || echo "  (未找到)"
           echo "  --- DNS（代理插件依赖 dnsmasq-full）---"
           grep -E '^CONFIG_PACKAGE_dnsmasq' .config | sed 's/^/  /'
           echo "  --- 硬件加速（保留，出厂默认关闭；缺失则需检查 defconfig）---"
@@ -520,6 +528,82 @@ jobs:
           echo "  --- eMMC 自动挂载依赖 ---"
           grep -E '^CONFIG_PACKAGE_(kmod-fs-ext4|block-mount|blkid)=' .config \
             | sed 's/^/  /' || echo "  (缺失！自动挂载将不生效)"
+
+      # ==================================================================
+      #  OAF 前置自检（v1.7.6 新增）
+      #
+      #  目的：用 5 分钟换 3 小时。
+      #
+      #  背景：v1.7.1 之前，OAF 曾导致整个构建失败，且失败发生在【最后】
+      #        的 opkg 安装阶段 —— 也就是白白编译 3 小时后才报错：
+      #          error: recursive dependency detected!
+      #          symbol PACKAGE_kmod-oaf is selected by PACKAGE_kmod-oaf
+      #          → kmod-oaf 被 kconfig 静默丢弃、从未编译
+      #          → pkg_hash_check_unresolved: cannot find dependency kmod-oaf
+      #          → package/install Error 255
+      #
+      #  根因至今【未明】：本次重新审查 oaf / open-app-filter /
+      #        luci-app-oaf 三个 Makefile，没有发现显式自引用；
+      #        也确认源码树没有预置 OAF（不存在重复定义）。
+      #        静态分析定位不了，只能实测。
+      #
+      #  策略：载入配置后立刻检查 .config
+      #        · luci-app-oaf=y 且 kmod-oaf=y  → 正常，继续
+      #        · luci-app-oaf=y 但 kmod-oaf 缺失 → 递归依赖又出现了！
+      #          此时继续编下去【必然】在最后失败。
+      #          ⇒ 自动把 OAF 三行从 .config 移除并重新 defconfig，
+      #            保证本次仍能出固件，同时打印醒目提示并写入 Release。
+      #
+      #  这样最坏情况只是少一个插件，不会白等 3 小时。
+      # ==================================================================
+      - name: OAF 前置自检
+        if: ${{ env.ASSEMBLE != '1' }}
+        run: |
+          cd openwrt
+          echo "OAF_SKIPPED=0" >> $GITHUB_ENV
+
+          if ! grep -q '^CONFIG_PACKAGE_luci-app-oaf=y$' .config; then
+            echo "  OAF 未启用，跳过自检"
+            exit 0
+          fi
+
+          echo "=== OAF 自检 ==="
+          echo "  luci-app-oaf: $(grep -m1 '^CONFIG_PACKAGE_luci-app-oaf=' .config)"
+          echo "  appfilter:    $(grep -m1 '^CONFIG_PACKAGE_appfilter=' .config || echo '(缺失)')"
+          echo "  kmod-oaf:     $(grep -m1 '^CONFIG_PACKAGE_kmod-oaf=' .config || echo '(缺失)')"
+
+          if grep -q '^CONFIG_PACKAGE_kmod-oaf=y$' .config; then
+            echo "  ✓ kmod-oaf 正常进入 .config，OAF 可以编译"
+            echo "OAF_OK=1" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo ""
+          echo "############################################################"
+          echo "# ⚠ OAF 自检失败：kmod-oaf 未进入 .config                  #"
+          echo "#                                                          #"
+          echo "# 原因：上游 kconfig 递归依赖（v1.7.1 已出现过一次）：        #"
+          echo "#   symbol PACKAGE_kmod-oaf is selected by PACKAGE_kmod-oaf #"
+          echo "# → kmod-oaf 被静默丢弃，不会被编译                          #"
+          echo "# → 若继续构建，最后 opkg 安装阶段必然报：                    #"
+          echo "#     cannot find dependency kmod-oaf for appfilter         #"
+          echo "#     package/install Error 255                             #"
+          echo "# → 白白浪费约 3 小时                                        #"
+          echo "#                                                          #"
+          echo "# 处理：自动移除 OAF，本次构建【继续】，仍会产出固件           #"
+          echo "############################################################"
+          echo ""
+
+          # 从 .config 移除 OAF 相关项，重新 defconfig 让依赖链重算
+          sed -i '/^CONFIG_PACKAGE_\(luci-app-oaf\|appfilter\|luci-i18n-oaf-zh-cn\|kmod-oaf\)=/d' .config
+          make defconfig
+
+          echo "=== 移除后的 OAF 状态（应无输出）==="
+          grep -E '^CONFIG_PACKAGE_(luci-app-oaf|appfilter|kmod-oaf)=' .config || echo "  ✓ 已彻底移除"
+
+          echo "OAF_SKIPPED=1" >> $GITHUB_ENV
+          echo "OAF_OK=0" >> $GITHUB_ENV
+          echo "OAF_SKIP_REASON=上游 kconfig 递归依赖：PACKAGE_kmod-oaf is selected by PACKAGE_kmod-oaf，内核模块被丢弃" >> $GITHUB_ENV
 
       - name: 应用定制项
         if: ${{ env.ASSEMBLE != '1' }}
@@ -732,14 +816,95 @@ jobs:
           done
 
 
+      # ==================================================================
+      #  编译固件（v1.7.5 重写：输出落盘 + 失败自动定位）
+      #
+      #  背景：连续多次失败在「编译固件」这一步，但 GitHub 网页日志超大
+      #        （显示 truncated），且手机/网页上很难翻到真正的报错行，
+      #        导致每次都要靠截图猜是哪个包挂了。
+      #
+      #  本次改造：
+      #    · 完整输出落盘到 openwrt/build.log（同时 tee 到屏幕）
+      #    · 失败时自动执行三段诊断：
+      #        ① grep "ERROR: package/xxx failed to build" —— 直接给出失败包
+      #        ② grep 常见致命原因（磁盘满 / OOM / 依赖缺失）
+      #        ③ 打印日志末尾 120 行
+      #    · 失败时把 build.log 尾部 8000 行存为 build-failure.log，
+      #      并在下一步作为 Artifact 上传，可下载后精确定位
+      #
+      #  ⚠ 用 set -o pipefail：否则 make | tee 时 make 的退出码会丢失，
+      #    失败也会被当成成功，固件根本没编出来却继续往下走。
+      # ==================================================================
       - name: 编译固件
         id: compile
         if: ${{ env.ASSEMBLE != '1' }}
         run: |
           cd openwrt
           ccache -M "${{ env.CCACHE_MAXSIZE }}" 2>/dev/null || true
-          make -j$(nproc) || make -j1 V=s
+
+          echo "=== 编译前磁盘 ==="
+          df -h / . 2>/dev/null | sed 's/^/  /'
+          echo "=== 编译前内存 ==="
+          free -h 2>/dev/null | sed 's/^/  /'
+
+          set -o pipefail
+          BUILD_LOG="$PWD/build.log"
+          : > "$BUILD_LOG"
+
+          # ---- 第一轮：并行 ----
+          if make -j$(nproc) 2>&1 | tee "$BUILD_LOG"; then
+            echo "=== 并行编译成功 ==="
+            BUILD_OK=1
+          else
+            echo "=== 并行编译失败，开始诊断 ==="
+            BUILD_OK=0
+          fi
+
+          if [ "$BUILD_OK" != "1" ]; then
+            echo ""
+            echo "############ 失败诊断 ############"
+
+            echo "--- [1] 编译失败的包 ---"
+            grep -E "ERROR: package/.* failed to build" "$BUILD_LOG" | sort -u | sed 's/^/  /'
+            grep -E "^ERROR:" "$BUILD_LOG" | sort -u | sed 's/^/  /'
+
+            echo "--- [2] 依赖缺失（cannot find dependency / unresolved）---"
+            grep -E "cannot find dependency|pkg_hash_check_unresolved|Cannot install package" "$BUILD_LOG" \
+              | sort -u | head -20 | sed 's/^/  /'
+
+            echo "--- [3] 磁盘 / 内存 ---"
+            grep -iE "no space left|out of memory|oom|killed" "$BUILD_LOG" \
+              | sort -u | head -20 | sed 's/^/  /'
+            df -h / . 2>/dev/null | sed 's/^/  /'
+            free -h 2>/dev/null | sed 's/^/  /'
+
+            echo "--- [4] 最后的 make 错误 ---"
+            grep -E "make.*\*\*\*|Error [0-9]+" "$BUILD_LOG" | tail -20 | sed 's/^/  /'
+
+            echo "--- [5] 日志末尾 120 行 ---"
+            tail -120 "$BUILD_LOG" | sed 's/^/  /'
+
+            # 保留尾部日志供上传（避免整个日志过大）
+            tail -8000 "$BUILD_LOG" > build-failure.log
+            echo "############ 诊断结束 ############"
+            echo ""
+            echo "完整日志见 Artifact: build-failure-log（本步末尾 8000 行）"
+            # 必须以非 0 退出，否则后续步骤会误以为编译成功
+            ccache -s 2>/dev/null | head -12 || true
+            exit 1
+          fi
+
           ccache -s 2>/dev/null | head -12 || true
+
+      # 失败时上传日志，便于精确定位（Artifact 保留 30 天）
+      - name: 上传编译失败日志
+        if: ${{ failure() && env.ASSEMBLE != '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log
+          path: openwrt/build-failure.log
+          if-no-files-found: ignore
+          retention-days: 30
 
       # ======================== 组装模式 ========================
       - name: 安装组装工具
@@ -817,6 +982,50 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/openwrt/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}"
 
       # ======================== 保存缓存 ========================
+      # ------------------------------------------------------------------
+      # 清理旧缓存（v1.7.5）
+      #
+      #   背景：日志反复出现
+      #     ##[warning]Cache save failed.
+      #
+      #   GitHub 缓存有两个硬约束：
+      #     ① 每个仓库总配额 10GB，超出后所有保存都会失败
+      #     ② 缓存【不可变】：同 key 已存在时无法覆盖，保存会失败
+      #
+      #   我们的 cache key 里带 CFG_HASH（配置指纹），
+      #   每改一次配置就产生一套全新 key，旧的那套仍占配额 7 天。
+      #   连续改了 5 版 → 5 套 × 4 类缓存 → 很容易把 10GB 撑爆。
+      #   配额一满，之后每次都是「冷编译」，耗时 3-4 小时且更脆弱。
+      #
+      #   这里在保存前删掉旧缓存腾出配额。best-effort：
+      #   失败也不影响构建（|| true）。
+      # ------------------------------------------------------------------
+      - name: 清理旧缓存
+        if: ${{ always() && env.ASSEMBLE != '1' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== 清理前缓存占用 ==="
+          gh cache list --limit 100 --json id,key,sizeInBytes 2>/dev/null             | head -5 || echo "  (gh 不可用，跳过)"
+          # 只删本 workflow 产生的缓存前缀，不动其他
+          for p in dl- go- ccache- ib-; do
+            IDS=$(gh cache list --limit 100 --json id,key 2>/dev/null                   | python3 -c "
+          import sys,json
+          try:
+              d=json.load(sys.stdin)
+          except Exception:
+              sys.exit(0)
+          pre='$p'
+          print(' '.join(str(c['id']) for c in d if str(c.get('key','')).startswith(pre)))
+          " 2>/dev/null || true)
+            if [ -n "$IDS" ]; then
+              echo "  删除前缀 $p 的旧缓存: $IDS"
+              for id in $IDS; do gh cache delete "$id" 2>/dev/null || true; done
+            fi
+          done
+          echo "=== 清理完成 ==="
+
+
       - name: 保存 dl 缓存
         if: ${{ always() && env.USE_CACHE == 'true' && env.ASSEMBLE != '1' }}
         uses: actions/cache/save@v4
@@ -874,6 +1083,10 @@ jobs:
       - name: 生成 Release 正文
         env:
           BUILD_START: ${{ env.BUILD_START }}
+          # OAF 自检结果（由「OAF 前置自检」步骤写入 GITHUB_ENV）
+          # 显式传递，确保 Release 正文能读到（不依赖隐式继承）
+          OAF_SKIPPED: ${{ env.OAF_SKIPPED }}
+          OAF_SKIP_REASON: ${{ env.OAF_SKIP_REASON }}
         run: |
           cd openwrt
           chmod +x "$GITHUB_WORKSPACE/gen-release-notes.sh"
