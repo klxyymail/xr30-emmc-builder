@@ -483,6 +483,37 @@ jobs:
                 echo "  [已移除] $d（避免 mihomo 被无端拉入编译）"
               fi
             done
+
+            # ------------------------------------------------------------------
+            # 移除 geoview 的包定义（v1.7.13 兜底，最彻底的手段）
+            #
+            #   背景：geoview 连续两轮拖垮构建：
+            #         03:14:01  make[3] -C feeds/packages/net/geoview compile
+            #         03:14:04  ERROR: package/feeds/packages/geoview failed to build.
+            #
+            #   它被拉入的原因（PassWall 源码 luci-app-passwall/Makefile）：
+            #       config PACKAGE_luci-app-passwall_INCLUDE_Geoview
+            #           bool "Include Geoview"
+            #           select PACKAGE_geoview
+            #           default y if aarch64||arm||i386||x86_64
+            #   select 优先级 > is not set，且 aarch64 下 default y。
+            #
+            #   v1.7.12 的教训：我改的符号名 INCLUDE_V2ray_Geoview 在源码里
+            #   【根本不存在】，等于没改。这说明「靠猜符号名」不可靠。
+            #
+            #   所以这里采取与 ssr-plus 相同的彻底手段：直接删包定义。
+            #   包定义没了，INCLUDE_Geoview 的 select 就失去目标，
+            #   kconfig 无法再把它拉进来 —— 不依赖符号名是否正确。
+            #
+            #   geoview 仅用于 Sing-box 分流，本配置走 Xray 分流，不需要。
+            # ------------------------------------------------------------------
+            for d in feeds/packages/net/geoview \
+                     package/feeds/packages/geoview; do
+              if [ -e "$d" ] || [ -L "$d" ]; then
+                rm -rf "$d"
+                echo "  [已移除] $d（geoview 连续两轮编译失败；Xray 分流不需要）"
+              fi
+            done
       - name: 载入机型配置
         if: ${{ env.ASSEMBLE != '1' }}
         run: |
@@ -613,6 +644,48 @@ jobs:
           echo "OAF_SKIPPED=1" >> $GITHUB_ENV
           echo "OAF_OK=0" >> $GITHUB_ENV
           echo "OAF_SKIP_REASON=上游 kconfig 递归依赖：PACKAGE_kmod-oaf is selected by PACKAGE_kmod-oaf，内核模块被丢弃" >> $GITHUB_ENV
+
+      - name: geoview 自检（防止被 PassWall 的 select 拉回）
+        if: ${{ env.ASSEMBLE != '1' }}
+        run: |
+          cd openwrt
+          #
+          # v1.7.12 新增：geoview 是连续两轮构建失败的元凶，
+          # 且它【不是】被我们直接选中的，而是被 PassWall 的开关 select 进来的：
+          #
+          #   config PACKAGE_luci-app-passwall_INCLUDE_Geoview
+          #       bool "Include Geoview"
+          #       select PACKAGE_geoview
+          #       default y if aarch64||arm||i386||x86_64
+          #
+          # kconfig 中 select 优先级 > is not set，且该开关 aarch64 下 default y。
+          # 只在配置里写 "# CONFIG_PACKAGE_geoview is not set" 【挡不住】
+          # （v1.7.11 已实测失败）。必须同时关掉上游开关 + 在此兜底。
+          #
+          # 兜底逻辑：若 geoview 仍出现在 .config，说明上游又改名 / 新增了
+          # 别的 select 来源 —— 直接把 geoview 与其所有可能的 INCLUDE 开关
+          # 一并清掉再 defconfig，保证不会再次拖垮构建。
+          #
+          echo "=== geoview 自检 ==="
+          echo "  --- .config 中所有 Geoview 相关项 ---"
+          grep -iE 'geoview' .config | sed 's/^/    /' || echo "    （无）"
+
+          if grep -q '^CONFIG_PACKAGE_geoview=y$' .config; then
+            echo "  ⚠ geoview 仍在 .config（被 select 拉入），执行强制移除"
+            sed -i '/^CONFIG_PACKAGE_geoview=/d' .config
+            sed -i '/^CONFIG_PACKAGE_luci-app-passwall_INCLUDE_.*[Gg]eoview.*=/d' .config
+            # 显式置为 n（default y if aarch64，不写会再次被打开）
+            echo "# CONFIG_PACKAGE_geoview is not set" >> .config
+            echo "# CONFIG_PACKAGE_luci-app-passwall_INCLUDE_V2ray_Geoview is not set" >> .config
+            echo "# CONFIG_PACKAGE_luci-app-passwall_INCLUDE_Geoview is not set" >> .config
+            make defconfig
+          fi
+
+          if grep -q '^CONFIG_PACKAGE_geoview=y$' .config; then
+            echo "  ✗ 移除失败，geoview 仍在 —— 请检查 PassWall Makefile"
+          else
+            echo "  ✓ geoview 未进入构建（Xray 分流不需要它）"
+          fi
 
       - name: 应用定制项
         if: ${{ env.ASSEMBLE != '1' }}
