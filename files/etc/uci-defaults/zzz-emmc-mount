@@ -1,34 +1,49 @@
 #!/bin/sh
 # ============================================================================
-#  eMMC 剩余空间自动挂载
+#  eMMC 剩余空间：自动分区 + 自动挂载
 #
 #  背景：CMCC XR30 eMMC 算力版为 64GB，固件仅占用前部一小部分，
-#        剩余约 54-57GB 默认【未挂载】。社区反馈该空间在 GPT 表中
-#        已存在为一个分区（如 /dev/mmcblk0p12），只是没有配置挂载点。
+#        剩余约 54-57GB 默认用不上。但这块空间有两种形态，
+#        【取决于你刷的 GPT 分区表】，脚本两条路都要覆盖：
 #
-#  本脚本在首次启动时执行：
-#    1. 在 /dev/mmcblk0p* 中寻找【最大的、未挂载的、且大于 2GB】的分区
-#    2. 已有文件系统 → 直接挂载
-#       无文件系统   → 格式化为 ext4 后挂载
-#    3. 挂载到 /mnt/emmc，并写入 /etc/config/fstab 实现开机自动挂载
-#    4. 幂等：已挂载 / 已写入 fstab 时不会重复格式化
+#    形态 A：剩余空间【已经是一个分区】（如 /dev/mmcblk0p12，55.9G）
+#            —— 只是没有挂载点。社区多数教程是这种情况。
+#            👉 直接格式化并挂载即可。
 #
-#  ⚠ 安全保护：
+#    形态 B：剩余空间【根本没有分区】，只是一段未分配空间（Free Space）
+#            —— 恩山多个帖子的实测："进入系统后发现 emmc 没有挂载上，
+#               默认是没有分区的，有一部分闲置空间"
+#            👉 必须先新建分区，再格式化挂载。
+#
+#  本脚本在首次启动时执行，自动判断属于哪种形态：
+#    A → 格式化（若需要）+ 挂载
+#    B → 新建分区 → 让内核重读分区表 → 格式化 + 挂载
+#        （若内核读不到新分区，则自动重启一次，下次启动走 A 路径）
+#
+#  ⚠⚠ 安全保护（全部已实现）⚠⚠
+#    · 绝不删除、修改任何已有分区 —— 只在未分配空间上新建
 #    · 跳过 rootfs / overlay 所在分区
 #    · 跳过已挂载的分区
-#    · 只处理大于 2GB 的分区（避免误操作 config / factory 等小分区）
+#    · 只处理大于 2GB 的空间（避开 config / factory 等小分区）
 #    · 只在 blkid 完全识别不到文件系统时才格式化
+#    · 幂等：重复执行不会重复分区、重复格式化
+#    · 任何一步失败都安全退出，不破坏数据
 #
-#  ⚠ 若你的剩余分区上仍有需要的数据，请在刷机【前】备份，
-#    或刷机后删除 /etc/uci-defaults/zzz-emmc-mount 再重启。
+#  依赖：kmod-fs-ext4  block-mount  blkid  fdisk  partx-utils  e2fsprogs
+#        （v1.7.7 补齐：fdisk / partx-utils / e2fsprogs 之前漏了，
+#          导致形态 B 下 mkfs.ext4 与分区命令都不存在）
 #
-#  文件名以 zzz- 开头：OpenWrt 的 uci-defaults 按文件名排序执行，
+#  文件名以 zzz- 开头：uci-defaults 按文件名排序执行，
 #  确保排在各包自带的 uci-defaults（如 turboacc）之后。
 # ============================================================================
 
 DEV=/dev/mmcblk0
 MNT=/mnt/emmc
-MIN_SIZE=4194304          # 2GB（单位：512 字节扇区）
+MIN_SECTORS=4194304        # 2GB（单位：512 字节扇区）
+TAG=emmc-mount
+FLAG=/etc/.emmc-partition-created
+
+log() { logger -t "$TAG" "$@"; }
 
 # 非 eMMC 设备直接退出
 [ -b "$DEV" ] || exit 0
@@ -41,87 +56,61 @@ while [ $i -lt 50 ]; do
     sleep 0.1
 done
 
-# ---------- 1. 找出 rootfs / overlay 所在分区，避免误操作 ----------
+# ---------- 工具可用性检查 ----------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------- 找出 rootfs / overlay 所在分区，避免误操作 ----------
 root_part=""
-# /proc/mounts 中 root 可能是 overlay:/overlay 或 /dev/mmcblk0pX
 if grep -q ' /overlay ' /proc/mounts 2>/dev/null; then
-    # overlayfs：找下层设备
     root_part=$(grep ' /rom ' /proc/mounts 2>/dev/null | awk '{print $1}')
     [ -n "$root_part" ] || root_part=$(grep ' / ' /proc/mounts | awk '{print $1}')
 else
     root_part=$(awk '$2=="/"{print $1}' /proc/mounts 2>/dev/null)
 fi
-# 统一为 /dev/mmcblk0pN 形式（若是 /dev/root 之类则忽略）
 case "$root_part" in
     /dev/mmcblk0p*) : ;;
     *) root_part="" ;;
 esac
 
-# ---------- 2. 扫描候选分区 ----------
-best_part=""
-best_size=0
+# ============================================================================
+#  通用：格式化并挂载一个指定分区
+# ============================================================================
+mount_part() {
+    part="$1"
 
-for part in /dev/mmcblk0p*; do
-    [ -b "$part" ] || continue
+    [ -b "$part" ] || return 1
+    [ "$part" = "$root_part" ] && return 1
 
     name=$(basename "$part")
-    # 跳过整盘（mmcblk0p0 不存在，但保险）
-    case "$name" in mmcblk0p0) continue ;; esac
-
-    # 跳过 root 分区
-    [ "$part" = "$root_part" ] && continue
-
-    # 跳过已挂载的（含作为 overlay 使用的）
-    if grep -q "^${part} " /proc/mounts 2>/dev/null; then
-        continue
-    fi
-
-    # 读取分区大小（512 字节扇区）
     size=$(cat "/sys/class/block/${name}/size" 2>/dev/null)
     case "$size" in ''|*[!0-9]*) size=0 ;; esac
 
-    # 只考虑大于 2GB 的分区
-    [ "$size" -gt "$MIN_SIZE" ] || continue
-
-    if [ "$size" -gt "$best_size" ]; then
-        best_size=$size
-        best_part=$part
+    # 已挂载则跳过
+    if grep -q "^${part} " /proc/mounts 2>/dev/null; then
+        return 1
     fi
-done
 
-if [ -z "$best_part" ]; then
-    logger -t emmc-mount "未找到符合条件的 eMMC 剩余分区，跳过"
-    exit 0
-fi
+    fs=$(blkid -s TYPE -o value "$part" 2>/dev/null)
 
-# ---------- 3. 确认 / 创建文件系统 ----------
-fs=$(blkid -s TYPE -o value "$best_part" 2>/dev/null)
-
-if [ -z "$fs" ]; then
-    logger -t emmc-mount "$best_part 无文件系统，格式化为 ext4"
-    if command -v mkfs.ext4 >/dev/null 2>&1; then
-        mkfs.ext4 -F -L emmc_data "$best_part" >/dev/null 2>&1
-        fs=$(blkid -s TYPE -o value "$best_part" 2>/dev/null)
-    else
-        logger -t emmc-mount "缺少 mkfs.ext4，无法格式化，跳过"
-        exit 0
+    if [ -z "$fs" ]; then
+        if ! have mkfs.ext4; then
+            log "缺少 mkfs.ext4（需 e2fsprogs 包），无法格式化 $part"
+            return 1
+        fi
+        log "$part 无文件系统，格式化为 ext4（约 $((size / 2097152)) GB）"
+        mkfs.ext4 -F -L emmc_data "$part" >/dev/null 2>&1
+        fs=$(blkid -s TYPE -o value "$part" 2>/dev/null)
     fi
-fi
 
-if [ -z "$fs" ]; then
-    logger -t emmc-mount "无法确定 $best_part 的文件系统，跳过"
-    exit 0
-fi
+    [ -z "$fs" ] && { log "无法确定 $part 的文件系统，跳过"; return 1; }
 
-logger -t emmc-mount "挂载 $best_part ($fs, $((best_size / 2097152)) GB) 到 $MNT"
+    log "挂载 $part ($fs, $((size / 2097152)) GB) 到 $MNT"
+    mkdir -p "$MNT"
 
-# ---------- 4. 写入 fstab 并挂载 ----------
-mkdir -p "$MNT"
-
-uci -q batch <<EOF
+    uci -q batch <<EOF
 delete fstab.emmc_data
 set fstab.emmc_data=mount
-set fstab.emmc_data.device='$best_part'
+set fstab.emmc_data.device='$part'
 set fstab.emmc_data.target='$MNT'
 set fstab.emmc_data.fstype='$fs'
 set fstab.emmc_data.options='rw,noatime'
@@ -130,18 +119,158 @@ set fstab.emmc_data.enabled_fsck='0'
 commit fstab
 EOF
 
-# 立即挂载（block 可用则用 block，否则 fallback 到 mount）
-if command -v block >/dev/null 2>&1; then
-    block mount >/dev/null 2>&1
-fi
-if ! grep -q "^${best_part} ${MNT} " /proc/mounts 2>/dev/null; then
-    mount -t "$fs" -o rw,noatime "$best_part" "$MNT" >/dev/null 2>&1
+    if have block; then
+        block mount >/dev/null 2>&1
+    fi
+    if ! grep -q "^${part} ${MNT} " /proc/mounts 2>/dev/null; then
+        mount -t "$fs" -o rw,noatime "$part" "$MNT" >/dev/null 2>&1
+    fi
+
+    if grep -q " ${MNT} " /proc/mounts 2>/dev/null; then
+        log "✓ 成功挂载到 $MNT"
+        rm -f "$FLAG"
+        return 0
+    fi
+
+    log "挂载失败，请检查日志"
+    return 1
+}
+
+# ============================================================================
+#  形态 A：已有大分区 → 直接挂载
+# ============================================================================
+best_part=""
+best_size=0
+for part in /dev/mmcblk0p*; do
+    [ -b "$part" ] || continue
+    name=$(basename "$part")
+    case "$name" in mmcblk0p0) continue ;; esac
+    [ "$part" = "$root_part" ] && continue
+    grep -q "^${part} " /proc/mounts 2>/dev/null && continue
+
+    size=$(cat "/sys/class/block/${name}/size" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    [ "$size" -gt "$MIN_SECTORS" ] || continue
+
+    if [ "$size" -gt "$best_size" ]; then
+        best_size=$size
+        best_part=$part
+    fi
+done
+
+if [ -n "$best_part" ]; then
+    log "检测到已有大分区 $best_part，走路径 A（直接挂载）"
+    mount_part "$best_part" && exit 0
 fi
 
-if grep -q " ${MNT} " /proc/mounts 2>/dev/null; then
-    logger -t emmc-mount "成功挂载到 $MNT"
-else
-    logger -t emmc-mount "挂载失败，请检查日志"
+# ============================================================================
+#  形态 B：没有大分区 → 尝试在未分配空间上新建
+# ============================================================================
+log "未找到已有的大分区，检查是否存在未分配空间"
+
+# 防重：上次已经建过分区但内核还没识别，避免反复分区
+if [ -f "$FLAG" ]; then
+    log "检测到上次已创建分区（$FLAG 存在）但内核仍未识别，跳过以免重复分区"
+    log "请手动重启一次，或执行: partx -a $DEV"
+    exit 0
 fi
+
+if ! have fdisk && ! have sfdisk; then
+    log "缺少分区工具（fdisk / sfdisk），无法在剩余空间上新建分区"
+    log "可 SSH 执行: opkg update && opkg install fdisk partx-utils"
+    exit 0
+fi
+
+# 统计未分配空间：整盘扇区数 - 所有分区占用
+disk_sectors=$(cat "/sys/class/block/mmcblk0/size" 2>/dev/null)
+case "$disk_sectors" in ''|*[!0-9]*) disk_sectors=0 ;; esac
+
+used_sectors=0
+last_end=0
+for part in /dev/mmcblk0p*; do
+    [ -b "$part" ] || continue
+    name=$(basename "$part")
+    s=$(cat "/sys/class/block/${name}/size" 2>/dev/null)
+    case "$s" in ''|*[!0-9]*) s=0 ;; esac
+    used_sectors=$((used_sectors + s))
+    start=$(cat "/sys/class/block/${name}/start" 2>/dev/null)
+    case "$start" in ''|*[!0-9]*) start=0 ;; esac
+    end=$((start + s))
+    [ "$end" -gt "$last_end" ] && last_end=$end
+done
+
+# 末尾未分配空间（GPT 通常在磁盘末尾留一段，取主要的一块）
+free_sectors=$((disk_sectors - last_end))
+
+log "整盘 $((disk_sectors / 2097152)) GB，已用至扇区 $last_end，末尾未分配约 $((free_sectors / 2097152)) GB"
+
+if [ "$free_sectors" -lt "$MIN_SECTORS" ]; then
+    log "未分配空间不足 2GB，无需处理"
+    exit 0
+fi
+
+# ---- 新建分区（fdisk 交互式，全部取默认值 = 占满剩余空间）----
+log "在剩余空间上新建分区..."
+
+if have fdisk; then
+    # n=新建  p/回车=主分区  回车=默认分区号  回车=默认起始  回车=默认结束(占满)  w=写入
+    # 若提示是否移除签名，答 N（保留，避免误清已有数据）
+    printf 'n\n\n\n\nN\nw\n' | fdisk "$DEV" >/dev/null 2>&1
+    rc=$?
+elif have sfdisk; then
+    printf ',+\n' | sfdisk --append "$DEV" >/dev/null 2>&1
+    rc=$?
+else
+    rc=1
+fi
+
+if [ "$rc" -ne 0 ]; then
+    log "分区创建命令返回 $rc，未做进一步操作（未破坏任何数据）"
+    exit 0
+fi
+
+log "分区表已写入，正在让内核重新读取..."
+
+# ---- 让内核重读分区表 ----
+new_part=""
+if have partx; then
+    partx -a "$DEV" >/dev/null 2>&1
+elif have blockdev; then
+    blockdev --rereadpt "$DEV" >/dev/null 2>&1
+fi
+sleep 2
+
+# 重新扫描，找出新出现的分区
+new_size=0
+for part in /dev/mmcblk0p*; do
+    [ -b "$part" ] || continue
+    name=$(basename "$part")
+    case "$name" in mmcblk0p0) continue ;; esac
+    [ "$part" = "$root_part" ] && continue
+    grep -q "^${part} " /proc/mounts 2>/dev/null && continue
+
+    size=$(cat "/sys/class/block/${name}/size" 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    [ "$size" -gt "$MIN_SECTORS" ] || continue
+
+    if [ "$size" -gt "$new_size" ]; then
+        new_size=$size
+        new_part=$part
+    fi
+done
+
+if [ -z "$new_part" ]; then
+    # 内核没能识别新分区 —— 这是 eMMC 上的常见情况，必须重启
+    log "⚠ 内核暂未识别新分区（eMMC 常见），将自动重启一次"
+    log "  重启后本脚本会再次运行并完成格式化与挂载"
+    touch "$FLAG"
+    sync
+    # 延迟重启，先让日志落盘
+    (sleep 5; reboot) >/dev/null 2>&1 &
+    exit 0
+fi
+
+log "新分区 $new_part 已就绪，继续格式化与挂载"
+mount_part "$new_part"
 
 exit 0

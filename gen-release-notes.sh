@@ -263,7 +263,8 @@ SECTION_COUNT=0
 emit_prefix_section "LuCI 应用" "luci-app-" \
     "luci-app-mtwifi-cfg luci-app-turboacc-mtk luci-app-eqos-mtk \
      luci-app-store luci-app-ddns-go luci-app-lucky \
-     luci-app-oaf luci-app-watchcat" && SECTION_COUNT=$((SECTION_COUNT+1))
+     luci-app-oaf luci-app-watchcat \
+     luci-app-harbor-file-pro" && SECTION_COUNT=$((SECTION_COUNT+1))
 emit_prefix_section "LuCI 主题" "luci-theme-" && SECTION_COUNT=$((SECTION_COUNT+1))
 
 emit_list_section "代理核心" \
@@ -294,6 +295,10 @@ emit_list_section "OpenAppFilter 应用过滤" \
 # Watchcat（网络看门狗）
 emit_list_section "Watchcat 网络看门狗" \
     watchcat luci-app-watchcat luci-i18n-watchcat-zh-cn 2>/dev/null && SECTION_COUNT=$((SECTION_COUNT+1))
+
+# Harbor File Pro（文件管理）：ucode 后端，纯 LuCI 包，无内核模块
+emit_list_section "Harbor 文件管理" \
+    luci-app-harbor-file-pro luci-i18n-harbor-file-pro-zh-cn 2>/dev/null && SECTION_COUNT=$((SECTION_COUNT+1))
 
 emit_list_section "代理插件与 Obfs" \
     simple-obfs v2ray-plugin xray-plugin kcptun-client redsocks2 2>/dev/null && SECTION_COUNT=$((SECTION_COUNT+1))
