@@ -74,6 +74,8 @@ env:
     istore     https://github.com/linkease/istore.git;main
     lucky      https://github.com/gdy666/luci-app-lucky.git;main
     oaf        https://github.com/destan19/OpenAppFilter.git;master
+    harbor     https://github.com/whzhni1/luci-app-harbor-file-pro.git;main
+
   # ==========================================================================
   #  固件定制（改这里 = 改 IP / 主机名 / 主题）
   # ==========================================================================
@@ -433,6 +435,7 @@ jobs:
                    luci-app-ddns-go ddns-go \
                    luci-app-lucky lucky \
                    luci-app-oaf appfilter \
+                   luci-app-harbor-file-pro \
                    luci-app-watchcat watchcat; do
             if find -L package/feeds -maxdepth 3 -name "$p" -type d 2>/dev/null | grep -q .; then
               echo "  [OK]   $p"
@@ -510,6 +513,7 @@ jobs:
           grep -E "^CONFIG_TARGET_${{ env.TARGET }}|^CONFIG_TARGET_MULTI_PROFILE" .config
           echo "=== 关键插件 ==="
           for k in luci-app-passwall luci-app-store luci-app-oaf \
+                   luci-app-harbor-file-pro \
                    luci-app-ddns-go luci-theme-argon luci-app-lucky; do
             grep -m1 "^CONFIG_PACKAGE_${k}=" .config || echo "  $k 未启用"
           done
@@ -525,9 +529,14 @@ jobs:
           echo "  --- 硬件加速（保留，出厂默认关闭；缺失则需检查 defconfig）---"
           grep -E '^CONFIG_PACKAGE_(luci-app-turboacc-mtk|kmod-mediatek_hnat|kmod-warp)=' .config \
             | sed 's/^/  /' || echo "  (未在 .config 中找到，可能已被取消)"
-          echo "  --- eMMC 自动挂载依赖 ---"
-          grep -E '^CONFIG_PACKAGE_(kmod-fs-ext4|block-mount|blkid)=' .config \
-            | sed 's/^/  /' || echo "  (缺失！自动挂载将不生效)"
+          echo "  --- eMMC 自动挂载依赖（6 个，v1.7.7 补齐后三个）---"
+          for k in kmod-fs-ext4 block-mount blkid e2fsprogs fdisk partx-utils; do
+            if grep -q "^CONFIG_PACKAGE_${k}=y$" .config; then
+              echo "    [OK]     $k"
+            else
+              echo "    [缺失]   $k"
+            fi
+          done
 
       # ==================================================================
       #  OAF 前置自检（v1.7.6 新增）
@@ -864,25 +873,51 @@ jobs:
             echo ""
             echo "############ 失败诊断 ############"
 
+            # ⚠ v1.7.11 修复：本段所有检索命令必须加 || true
+            #   脚本开头有 set -o pipefail，而 GitHub 的 bash -e {0} 又开了 -e。
+            #   在 pipefail 下，管道中【任一环节】失败 → 整条管道返回非 0
+            #   → set -e 立即终止脚本。
+            #   实测：第 [1] 段的第二个 grep（"^ERROR:"）无匹配返回 1，
+            #         导致 [2]~[5] 全部没执行、build-failure.log 也没生成，
+            #         Artifact 上传时报 "No files were found"。
+            #         —— 诊断脚本自己制造了「查不到原因」。
+            #   （日志里 ERROR 行实际形如 "    ERROR: package/... failed"，
+            #     前面有空格，故 "^ERROR:" 永远匹配不到。）
+
             echo "--- [1] 编译失败的包 ---"
-            grep -E "ERROR: package/.* failed to build" "$BUILD_LOG" | sort -u | sed 's/^/  /'
-            grep -E "^ERROR:" "$BUILD_LOG" | sort -u | sed 's/^/  /'
+            grep -E "ERROR: package/.* failed to build" "$BUILD_LOG" | sort -u | sed 's/^/  /' || true
+            grep -E "^[[:space:]]*ERROR:" "$BUILD_LOG" | sort -u | sed 's/^/  /' || true
 
             echo "--- [2] 依赖缺失（cannot find dependency / unresolved）---"
             grep -E "cannot find dependency|pkg_hash_check_unresolved|Cannot install package" "$BUILD_LOG" \
-              | sort -u | head -20 | sed 's/^/  /'
+              | sort -u | head -20 | sed 's/^/  /' || true
 
             echo "--- [3] 磁盘 / 内存 ---"
             grep -iE "no space left|out of memory|oom|killed" "$BUILD_LOG" \
-              | sort -u | head -20 | sed 's/^/  /'
-            df -h / . 2>/dev/null | sed 's/^/  /'
-            free -h 2>/dev/null | sed 's/^/  /'
+              | sort -u | head -20 | sed 's/^/  /' || true
+            df -h / . 2>/dev/null | sed 's/^/  /' || true
+            free -h 2>/dev/null | sed 's/^/  /' || true
 
             echo "--- [4] 最后的 make 错误 ---"
-            grep -E "make.*\*\*\*|Error [0-9]+" "$BUILD_LOG" | tail -20 | sed 's/^/  /'
+            grep -E "make.*\*\*\*|Error [0-9]+" "$BUILD_LOG" | tail -20 | sed 's/^/  /' || true
 
-            echo "--- [5] 日志末尾 120 行 ---"
-            tail -120 "$BUILD_LOG" | sed 's/^/  /'
+            echo "--- [5] 失败包的详细编译日志（真正的报错在这里）---"
+            # make 并行编译时，每个包的完整输出在 logs/<包路径>/compile.txt，
+            # 终端只会打印一行 "ERROR: package/xxx failed to build."。
+            # 不看这个文件就永远不知道真正原因。
+            for p in $(grep -oE "package/[^ ]+ failed to build" "$BUILD_LOG" \
+                       | sed 's# failed to build##' | sort -u); do
+              f="logs/${p}/compile.txt"
+              if [ -f "$f" ]; then
+                echo "  ### ${f}（末尾 100 行）"
+                tail -100 "$f" 2>/dev/null | sed 's/^/  /' || true
+              else
+                echo "  （无 ${f}，可能失败在 prepare/download 阶段）"
+              fi
+            done || true
+
+            echo "--- [6] 日志末尾 120 行 ---"
+            tail -120 "$BUILD_LOG" | sed 's/^/  /' || true
 
             # 保留尾部日志供上传（避免整个日志过大）
             tail -8000 "$BUILD_LOG" > build-failure.log
